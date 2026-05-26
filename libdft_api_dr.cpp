@@ -24,6 +24,7 @@
 #include "libdft_log.h"
 #include "mnt_consumer_dr.h"
 #include "sdft_hook_dr.h"
+#include "libdft_core_dr.h"
 
 /* cmp.out / lea.out outputs (empty in Phase 2; DR file handles). */
 file_t out = INVALID_FILE;
@@ -218,6 +219,10 @@ libdft_setup(void)
 			dr_fprintf(STDERR, "[sdft_hook] disabled (VUZZER_SDFT=off)\n");
 		}
 	}
+
+	/* C.4 Phase 5: opcode-level taint propagation. Registers the BB
+	 * instrumentation event; must follow mnt::init() (router uses is_mnt). */
+	libdft_core_init();
 
 	dr_register_exit_event(event_exit);
 }
