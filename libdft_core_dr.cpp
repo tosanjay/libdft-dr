@@ -259,6 +259,14 @@ mov_clr_mem(ADDRINT addr, uint n)
     file_tagmap_clrn(addr, n);
 }
 
+/* mem -> mem byte-tag copy (PUSH/POP with a memory operand). */
+static void
+m2m_xfer(ADDRINT dst_addr, ADDRINT src_addr, uint n)
+{
+    for (uint i = 0; i < n; i++)
+        tagmap_setb_with_tag(dst_addr + i, file_tagmap_getb(src_addr + i));
+}
+
 /* ---------- binary combine handlers (ADD/AND/OR/XOR/SBB/SUB) ----------
  * Arithmetic/logical RMW mixes operand taint: dst[i] = combine(dst[i], src[i])
  * (EWAH union). The immediate-source forms carry no taint and are not
@@ -570,6 +578,54 @@ cmp_i2m(ptr_uint_t ins, ADDRINT dest_addr, uint32_t imm, uint size)
     }
 }
 
+/* CMPS (string compare): both operands are memory. Mirrors libdft file_cmp_m2m
+ * -- gate each byte on numberOfOnes in (0, limit_offset], value field uses a
+ * 4-byte read for the 8/4 cases (as libdft does). */
+static void
+cmp_m2m(ptr_uint_t ins, ADDRINT dest_addr, ADDRINT src_addr, uint size)
+{
+    if (!file_tag_testb(dest_addr) || !file_tag_testb(src_addr))
+        return;
+    std::vector<tag_t> dest(size), src(size);
+    fill_mem_tags(dest_addr, size, dest);
+    fill_mem_tags(src_addr, size, src);
+
+    std::vector<std::string> o(21, "{}");
+    int fl = 0;
+    for (uint i = 0; i < size; i++) {
+        size_t dn = dest[i].numberOfOnes();
+        if (dn > 0 && dn <= (size_t)limit_offset) {
+            if (fl == 0) { o[2] = hexstr_u(ins); fl = 1; }
+        }
+        o[i + 3] = tag_sprint(dest[i]);
+        size_t sn = src[i].numberOfOnes();
+        if (sn > 0 && sn <= (size_t)limit_offset) {
+            if (fl == 0) { o[2] = hexstr_u(ins); fl = 1; }
+        }
+        o[i + 11] = tag_sprint(src[i]);
+    }
+    if (fl) {
+        switch (size) {
+            case 8:
+            case 4:
+                o[19] = hexstr_u((uint32_t)read_mem_val(dest_addr, 4));
+                o[20] = hexstr_u((uint32_t)read_mem_val(src_addr, 4));
+                break;
+            case 2:
+                o[19] = hexstr_u((uint16_t)read_mem_val(dest_addr, 2));
+                o[20] = hexstr_u((uint16_t)read_mem_val(src_addr, 2));
+                break;
+            case 1:
+                o[19] = hexstr_u((uint8_t)read_mem_val(dest_addr, 1));
+                o[20] = hexstr_u((uint8_t)read_mem_val(src_addr, 1));
+                break;
+        }
+        o[0] = int2str((int)size * 8);
+        o[1] = "mem mem";
+        emit_cmp(o);
+    }
+}
+
 /* ---------- instrumentation inserters ---------- */
 
 static void
@@ -639,6 +695,48 @@ release_mem_addr(void *dc, instrlist_t *bb, instr_t *where, mem_ea *ea)
 {
     drreg_unreserve_register(dc, bb, where, ea->scratch);
     drreg_unreserve_register(dc, bb, where, ea->addr);
+    drreg_unreserve_aflags(dc, bb, where);
+}
+
+/* Two memory EAs at once (m2m: CMPS, PUSH/POP mem). addr1/addr2 hold the EAs;
+ * one shared scratch is reused for both drutil computations. */
+struct mem_ea2 {
+    reg_id_t addr1;
+    reg_id_t addr2;
+    reg_id_t scratch;
+};
+
+static bool
+acquire_mem_addr2(void *dc, instrlist_t *bb, instr_t *where, opnd_t m1, opnd_t m2,
+                  mem_ea2 *out)
+{
+    out->addr1 = out->addr2 = out->scratch = DR_REG_NULL;
+    if (drreg_reserve_aflags(dc, bb, where) != DRREG_SUCCESS)
+        return false;
+    bool ok = drreg_reserve_register(dc, bb, where, NULL, &out->addr1) == DRREG_SUCCESS &&
+              drreg_reserve_register(dc, bb, where, NULL, &out->addr2) == DRREG_SUCCESS &&
+              drreg_reserve_register(dc, bb, where, NULL, &out->scratch) == DRREG_SUCCESS &&
+              drutil_insert_get_mem_addr(dc, bb, where, m1, out->addr1, out->scratch) &&
+              drutil_insert_get_mem_addr(dc, bb, where, m2, out->addr2, out->scratch);
+    if (!ok) {
+        if (out->scratch != DR_REG_NULL)
+            drreg_unreserve_register(dc, bb, where, out->scratch);
+        if (out->addr2 != DR_REG_NULL)
+            drreg_unreserve_register(dc, bb, where, out->addr2);
+        if (out->addr1 != DR_REG_NULL)
+            drreg_unreserve_register(dc, bb, where, out->addr1);
+        drreg_unreserve_aflags(dc, bb, where);
+        return false;
+    }
+    return true;
+}
+
+static void
+release_mem_addr2(void *dc, instrlist_t *bb, instr_t *where, mem_ea2 *ea)
+{
+    drreg_unreserve_register(dc, bb, where, ea->scratch);
+    drreg_unreserve_register(dc, bb, where, ea->addr2);
+    drreg_unreserve_register(dc, bb, where, ea->addr1);
     drreg_unreserve_aflags(dc, bb, where);
 }
 
@@ -826,7 +924,23 @@ is_stack_ptr_reg(reg_id_t r)
     return r == DR_REG_RSP || r == DR_REG_ESP || r == DR_REG_SP;
 }
 
-/* PUSH reg -> stack slot (r2m); PUSH imm -> clear stack; PUSH mem -> m2m (TODO). */
+/* mem -> mem byte-tag copy: emit the two-EA acquire + m2m_xfer clean call. */
+static void
+insert_m2m_xfer(void *dc, instrlist_t *bb, instr_t *instr, opnd_t dst_mem,
+                opnd_t src_mem, uint n)
+{
+    if (n == 0)
+        return;
+    mem_ea2 ea;
+    if (!acquire_mem_addr2(dc, bb, instr, dst_mem, src_mem, &ea))
+        return;
+    dr_insert_clean_call(dc, bb, instr, (void *)m2m_xfer, false, 3,
+                         opnd_create_reg(ea.addr1), opnd_create_reg(ea.addr2),
+                         OPND_CREATE_INT32(n));
+    release_mem_addr2(dc, bb, instr, &ea);
+}
+
+/* PUSH reg -> stack slot (r2m); PUSH imm -> clear stack; PUSH mem -> m2m. */
 static void
 insert_push(void *dc, instrlist_t *bb, instr_t *instr)
 {
@@ -851,11 +965,15 @@ insert_push(void *dc, instrlist_t *bb, instr_t *instr)
             insert_mov_clr_mem(dc, bb, instr, mem);
             return;
         }
-        /* memory source (PUSH [mem]) -> m2m: deferred. */
+        if (opnd_is_memory_reference(s)) {
+            insert_m2m_xfer(dc, bb, instr, mem, s,
+                            (uint)opnd_size_in_bytes(opnd_get_size(mem)));
+            return;
+        }
     }
 }
 
-/* POP -> reg (m2r from stack slot); POP mem -> m2m (TODO). */
+/* POP -> reg (m2r from stack slot); POP mem -> m2m. */
 static void
 insert_pop(void *dc, instrlist_t *bb, instr_t *instr)
 {
@@ -874,7 +992,62 @@ insert_pop(void *dc, instrlist_t *bb, instr_t *instr)
             insert_mov_m2r(dc, bb, instr, opnd_get_reg(o), mem);
             return;
         }
-        /* memory destination (POP [mem]) -> m2m: deferred. */
+        if (opnd_is_memory_reference(o)) {
+            insert_m2m_xfer(dc, bb, instr, o, mem,
+                            (uint)opnd_size_in_bytes(opnd_get_size(o)));
+            return;
+        }
+    }
+}
+
+/* CMPS (string compare): both operands memory. Match libdft's dest/src:
+ * dest = ES:[rdi], src = DS:[rsi] (keyed off the base register, robust to DR's
+ * src ordering). */
+static void
+insert_cmps(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    opnd_t m[2];
+    int nm = 0;
+    for (int k = 0; k < instr_num_srcs(instr) && nm < 2; k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_memory_reference(s))
+            m[nm++] = s;
+    }
+    if (nm != 2)
+        return;
+    opnd_t dst_mem = m[0], src_mem = m[1];
+    /* dest = the [rdi] operand, src = the [rsi] operand. */
+    reg_id_t b0 = opnd_get_base(m[0]);
+    if (b0 == DR_REG_RSI || b0 == DR_REG_ESI) {
+        dst_mem = m[1];
+        src_mem = m[0];
+    }
+    uint size = (uint)opnd_size_in_bytes(opnd_get_size(dst_mem));
+    if (size == 0)
+        return;
+    mem_ea2 ea;
+    if (!acquire_mem_addr2(dc, bb, instr, dst_mem, src_mem, &ea))
+        return;
+    app_pc pc = instr_get_app_pc(instr);
+    dr_insert_clean_call(dc, bb, instr, (void *)cmp_m2m, false, 4,
+                         OPND_CREATE_INTPTR((ptr_int_t)pc),
+                         opnd_create_reg(ea.addr1), opnd_create_reg(ea.addr2),
+                         OPND_CREATE_INT32(size));
+    release_mem_addr2(dc, bb, instr, &ea);
+}
+
+/* LEAVE = (mov rsp,rbp ; pop rbp): rsp gets rbp's taint, then rbp gets the
+ * stack slot's taint ([old rbp]). */
+static void
+insert_leave(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    insert_r2r_xfer(dc, bb, instr, DR_REG_RSP, DR_REG_RBP);
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_memory_reference(s)) {
+            insert_mov_m2r(dc, bb, instr, DR_REG_RBP, s);
+            return;
+        }
     }
 }
 
@@ -1073,7 +1246,12 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
         case OP_pop:
             insert_pop(drcontext, bb, instr);
             break;
-        /* 5.1 next: OP_cmps (m2m), OP_leave, PUSH/POP mem (m2m). */
+        case OP_cmps:
+            insert_cmps(drcontext, bb, instr);
+            break;
+        case OP_leave:
+            insert_leave(drcontext, bb, instr);
+            break;
         default:
             break;  /* no propagation yet */
     }

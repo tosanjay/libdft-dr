@@ -182,7 +182,7 @@ void
 libdft_setup(void)
 {
 	drmgr_init();
-	drreg_options_t ops = { sizeof(ops), 3 /*max scratch slots*/, false };
+	drreg_options_t ops = { sizeof(ops), 4 /*max scratch slots: 2 mem-EA regs + scratch + headroom*/, false };
 	drreg_init(&ops);
 
 	tls_idx = drmgr_register_tls_field();
