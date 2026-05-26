@@ -340,6 +340,72 @@ xchg_m2r(ADDRINT addr, uint row, uint start, uint n)
     }
 }
 
+/* ---------- CMOVcc (predicated transfer) ----------
+ * Taint moves only when the condition holds (Pin uses InsertPredicatedCall);
+ * we evaluate the DR predicate against the app's saved EFLAGS so we never add
+ * taint on the not-taken path (preserves the zero-false-offset property). */
+static bool
+cond_triggered(int pred, reg_t flags)
+{
+    bool cf = (flags >> 0) & 1, pf = (flags >> 2) & 1, zf = (flags >> 6) & 1,
+         sf = (flags >> 7) & 1, of = (flags >> 11) & 1;
+    switch (pred) {
+        case DR_PRED_O:   return of;
+        case DR_PRED_NO:  return !of;
+        case DR_PRED_B:   return cf;
+        case DR_PRED_NB:  return !cf;
+        case DR_PRED_Z:   return zf;
+        case DR_PRED_NZ:  return !zf;
+        case DR_PRED_BE:  return cf || zf;
+        case DR_PRED_NBE: return !cf && !zf;
+        case DR_PRED_S:   return sf;
+        case DR_PRED_NS:  return !sf;
+        case DR_PRED_P:   return pf;
+        case DR_PRED_NP:  return !pf;
+        case DR_PRED_L:   return sf != of;
+        case DR_PRED_NL:  return sf == of;
+        case DR_PRED_LE:  return zf || (sf != of);
+        case DR_PRED_NLE: return !zf && (sf == of);
+        default:          return false;  /* unknown -> don't propagate (safe) */
+    }
+}
+
+static bool
+cmov_taken(void *dc, int pred)
+{
+    dr_mcontext_t mc;
+    mc.size = sizeof(mc);
+    mc.flags = DR_MC_CONTROL;  /* xflags */
+    dr_get_mcontext(dc, &mc);
+    return cond_triggered(pred, mc.xflags);
+}
+
+static void
+cmov_r2r(int pred, uint d_row, uint d_start, uint s_row, uint s_start, uint n)
+{
+    void *dc = dr_get_current_drcontext();
+    if (!cmov_taken(dc, pred))
+        return;
+    thread_ctx_t *tc = libdft_get_thread_ctx(dc);
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < n; i++)
+        tc->vcpu.gpr_file[d_row][d_start + i] = tc->vcpu.gpr_file[s_row][s_start + i];
+}
+
+static void
+cmov_m2r(int pred, uint d_row, uint d_start, ADDRINT addr, uint n)
+{
+    void *dc = dr_get_current_drcontext();
+    if (!cmov_taken(dc, pred))
+        return;
+    thread_ctx_t *tc = libdft_get_thread_ctx(dc);
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < n; i++)
+        tc->vcpu.gpr_file[d_row][d_start + i] = file_tagmap_getb(addr + i);
+}
+
 /* ---------- binary combine handlers (ADD/AND/OR/XOR/SBB/SUB) ----------
  * Arithmetic/logical RMW mixes operand taint: dst[i] = combine(dst[i], src[i])
  * (EWAH union). The immediate-source forms carry no taint and are not
@@ -1321,6 +1387,50 @@ insert_lea(void *dc, instrlist_t *bb, instr_t *instr)
                          OPND_CREATE_INT32(d_n));
 }
 
+/* CMOVcc: predicated reg<-reg/mem transfer; the predicate (instr_get_predicate)
+ * is evaluated at runtime in the handler. */
+static void
+insert_cmov(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (!opnd_is_reg(d))
+        return;
+    reg_id_t dst = opnd_get_reg(d);
+    uint d_row, d_start, d_n;
+    if (!reg_shadow_span(dst, &d_row, &d_start, &d_n))
+        return;
+    int pred = (int)instr_get_predicate(instr);
+
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_memory_reference(s)) {
+            mem_ea ea;
+            if (!acquire_mem_addr(dc, bb, instr, s, &ea))
+                return;
+            dr_insert_clean_call(dc, bb, instr, (void *)cmov_m2r, false, 5,
+                                 OPND_CREATE_INT32(pred), OPND_CREATE_INT32(d_row),
+                                 OPND_CREATE_INT32(d_start), opnd_create_reg(ea.addr),
+                                 OPND_CREATE_INT32(d_n));
+            release_mem_addr(dc, bb, instr, &ea);
+            return;
+        }
+        if (opnd_is_reg(s) && reg_is_gpr(opnd_get_reg(s)) &&
+            opnd_get_reg(s) != dst) {
+            uint s_row, s_start, s_n;
+            if (!reg_shadow_span(opnd_get_reg(s), &s_row, &s_start, &s_n))
+                return;
+            uint n = (d_n < s_n) ? d_n : s_n;
+            dr_insert_clean_call(dc, bb, instr, (void *)cmov_r2r, false, 6,
+                                 OPND_CREATE_INT32(pred), OPND_CREATE_INT32(d_row),
+                                 OPND_CREATE_INT32(d_start), OPND_CREATE_INT32(s_row),
+                                 OPND_CREATE_INT32(s_start), OPND_CREATE_INT32(n));
+            return;
+        }
+    }
+}
+
 static void
 insert_cmp(void *dc, instrlist_t *bb, instr_t *instr)
 {
@@ -1503,9 +1613,18 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
         case OP_xchg:
             insert_xchg(drcontext, bb, instr);
             break;
-        /* deferred (predicated/conditional -> false-positive risk, or REP/
-         * sdft-covered): CMOV*, CMPXCHG, XADD, string MOVS/STOS/LODS/SCAS.
-         * No-op in libdft too: shift/rotate family. */
+        case OP_cmovo:  case OP_cmovno:
+        case OP_cmovb:  case OP_cmovnb:
+        case OP_cmovz:  case OP_cmovnz:
+        case OP_cmovbe: case OP_cmovnbe:
+        case OP_cmovs:  case OP_cmovns:
+        case OP_cmovp:  case OP_cmovnp:
+        case OP_cmovl:  case OP_cmovnl:
+        case OP_cmovle: case OP_cmovnle:
+            insert_cmov(drcontext, bb, instr);  /* predicate evaluated at runtime */
+            break;
+        /* deferred (REP/sdft-covered or conditional-RMW): CMPXCHG, XADD,
+         * string MOVS/STOS/LODS/SCAS. No-op in libdft too: shift/rotate. */
         default:
             break;  /* no propagation yet */
     }
