@@ -1,42 +1,35 @@
-/* tagmap.h -- shadow memory for the DR taint engine (C.4 Phase 2).
+/* tagmap.h -- shadow memory for the DR taint engine.
  *
- * Ported from libdft64/tagmap.h. The data structure (3-level page table of
- * EWAHBoolArray tags) and the public API are UNCHANGED so that:
- *   - source-painting produces byte-identical tags to the Pin baseline
- *     (load-bearing for the later cmp.out/lea.out parity gates), and
- *   - the Phase 5 opcode handlers can target the same tag_dir_setb/getb API.
+ * Phase 5.2 (interned-label tag representation, arch-doc D32): the per-byte
+ * shadow cell is a 4-byte interned label (`dft_label.id`) into a global
+ * set table that lives in tagmap.cpp. id 0 == the empty set. The EWAH set
+ * machinery is confined to tagmap.cpp; on the hot path (MOV/store/combine of
+ * register and memory shadow) a cell is just a 4-byte value, so copies are a
+ * single move and combine is a memoized 2-label lookup. The actual offset set
+ * is materialized only at the rare cmp.out/lea.out sinks (tag_sprint).
  *
- * Only the Pin dependency is swapped: pin.H -> dr_compat.h (type bridge) and
- * Pin's LOG() -> the no-op shim. We use the system EWAHBoolArray header
- * (<ewah.h>, EWAHBoolArray 0.4.0) deliberately rather than vendoring a fresh
- * copy: the Pin tree links the same system header, so the tag bit layout is
- * guaranteed identical across both arms.
+ * The public API (tag_t, tag_combine/sprint/count, .set/.numberOfOnes,
+ * tag_traits::cleared_val, tag_dir_setb/getb, file_tagmap_*) is unchanged from
+ * the EWAH version so the syscall source-painting and the Phase-5 opcode
+ * handlers compile untouched and produce byte-identical sink output.
+ *
+ * NOTE: the global set table is process-global and lock-free; valid because
+ * the taint targets are single-threaded CLI parsers. A multi-threaded SUT
+ * would need a lock around intern/combine (see tagmap.cpp).
  */
 #ifndef __TAGMAP_H__
 #define __TAGMAP_H__
 
-#include <utility>
-#include <ewah.h>
-#include <map>
-#include <new>
-#include <algorithm>
-#include <sstream>
+#include <cstdint>
 #include <string>
 
 #include "dr_compat.h"
 #include "libdft_log.h"
 
-typedef EWAHBoolArray<uint32_t> libdft_tag_ewah;
-
 #define FLAG_TYPE uint8_t
-
-typedef libdft_tag_ewah tag_t;
-
 #define VALUE_ID 0
 
-/*
- * the bitmap size in bytes
- */
+/* the bitmap geometry (unchanged) */
 #define PAGE_SIZE	4096
 #define PAGE_BITS	12
 #define TOP_DIR_SZ 		0x800000
@@ -48,14 +41,35 @@ typedef libdft_tag_ewah tag_t;
 
 #define VIRT2PAGETABLE(addr) ((addr) >> PAGETABLE_BITS)
 #define VIRT2PAGETABLE_OFFSET(addr) (((addr) & PAGETABLE_OFFSET_MASK)>>PAGE_BITS)
-
 #define VIRT2PAGE(addr) VIRT2PAGETABLE_OFFSET(addr)
 #define VIRT2OFFSET(addr) ((addr) & OFFSET_MASK)
 
-#define TEST_MASK(src,mask) ((src&(mask)) == (mask))
-#define SET_MASK(src,mask) (src|mask)
-#define CLR_MASK(src,mask) (src&(~(mask)))
+/* Interned-label shadow cell. Trivially copyable (4 bytes). id 0 = empty. */
+struct dft_label {
+	uint32_t id;
+	void set(uint32_t offset);        /* intern singleton {offset} into this */
+	uint32_t numberOfOnes() const;    /* size of the interned set */
+};
 
+typedef dft_label tag_t;
+
+template<typename T> struct tag_traits {};
+template<>
+struct tag_traits<dft_label> {
+	typedef dft_label type;
+	static const dft_label cleared_val;
+};
+
+/* union of two labels' sets, memoized -> result label */
+tag_t tag_combine(tag_t & lhs, tag_t & rhs);
+/* materialize the label's offset set as "{a,b,...}" / "{}" (sink-only) */
+std::string tag_sprint(tag_t const & tag);
+/* nonempty test (id != 0) */
+bool tag_count(tag_t const & tag);
+
+extern void libdft_die();
+
+/* three-level page table of labels */
 typedef struct {
 	tag_t tag [PAGE_SIZE];
 } tag_page_t;
@@ -66,34 +80,10 @@ typedef struct {
 	tag_table_t* table[TOP_DIR_SZ];
 } tag_dir_t;
 
-template<typename T> struct tag_traits {};
-template<typename T> T tag_combine(T & lhs, T & rhs);
-template<typename T> std::string tag_sprint(T const & tag);
-template<typename T> bool tag_count(T const & tag);
-
-template<>
-struct tag_traits<EWAHBoolArray<uint32_t>>
-{
-        typedef EWAHBoolArray<uint32_t> type;
-        typedef uint8_t inner_type;
-        static const bool is_container = true;
-        static const EWAHBoolArray<uint32_t> cleared_val;
-        static const EWAHBoolArray<uint32_t> set_val;
-};
-template<>
-EWAHBoolArray<uint32_t> tag_combine(EWAHBoolArray<uint32_t> & lhs, EWAHBoolArray<uint32_t> & rhs);
-template<>
-std::string tag_sprint(EWAHBoolArray<uint32_t> const & tag);
-template<>
-bool tag_count(EWAHBoolArray<uint32_t> const & tag);
-
-extern void libdft_die();
-
 /* tagmap API */
 int tagmap_alloc(void);
 void tagmap_free(void);
 
-/* File Taint */
 inline void tag_dir_setb(tag_dir_t & dir, ADDRINT addr, tag_t const & tag)
 {
     if(addr > 0x7fffffffffff){
@@ -102,27 +92,22 @@ inline void tag_dir_setb(tag_dir_t & dir, ADDRINT addr, tag_t const & tag)
     if(dir.table[VIRT2PAGETABLE(addr)] == NULL)
     {
         tag_table_t * new_table = new (std::nothrow) tag_table_t();
-        if (new_table == NULL)
-        {
+        if (new_table == NULL) {
             LOG("Failed to allocate tag table!\n");
             libdft_die();
         }
         dir.table[VIRT2PAGETABLE(addr)] = new_table;
     }
-
     tag_table_t * table = dir.table[VIRT2PAGETABLE(addr)];
     if ((*table).page[VIRT2PAGE(addr)] == NULL)
     {
         tag_page_t * new_page = new (std::nothrow) tag_page_t();
-        if (new_page == NULL)
-        {
+        if (new_page == NULL) {
             LOG("Failed to allocate tag page!\n");
             libdft_die();
         }
-        std::fill(new_page->tag, new_page->tag + PAGE_SIZE, tag_traits<tag_t>::cleared_val);
-        (*table).page[VIRT2PAGE(addr)] = new_page;
+        (*table).page[VIRT2PAGE(addr)] = new_page;  /* value-init -> id 0 */
     }
-
     tag_page_t * page = (*table).page[VIRT2PAGE(addr)];
     (*page).tag[VIRT2OFFSET(addr)] = tag;
 }
