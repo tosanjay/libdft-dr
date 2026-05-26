@@ -333,6 +333,37 @@ movzx_m2r(uint d_row, ADDRINT addr, uint srcn, uint dstn)
         tc->vcpu.gpr_file[d_row][i] = tag_traits<tag_t>::cleared_val;
 }
 
+/* ---------- MOVSX/MOVSXD (sign-extend) ----------
+ * Principled semantics (arch-doc D27, user decision): copy the source byte
+ * tags, then fill the sign-extension region with the TOP source byte's tag
+ * (the byte whose sign bit drives the extension). Differs from libdft's quirky
+ * source-pattern tiling. */
+static void
+movsx_r2r(uint d_row, uint s_row, uint s_start, uint srcn, uint dstn)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || srcn == 0)
+        return;
+    for (uint i = 0; i < srcn; i++)
+        tc->vcpu.gpr_file[d_row][i] = tc->vcpu.gpr_file[s_row][s_start + i];
+    tag_t sign = tc->vcpu.gpr_file[s_row][s_start + srcn - 1];
+    for (uint i = srcn; i < dstn; i++)
+        tc->vcpu.gpr_file[d_row][i] = sign;
+}
+
+static void
+movsx_m2r(uint d_row, ADDRINT addr, uint srcn, uint dstn)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || srcn == 0)
+        return;
+    for (uint i = 0; i < srcn; i++)
+        tc->vcpu.gpr_file[d_row][i] = file_tagmap_getb(addr + i);
+    tag_t sign = file_tagmap_getb(addr + srcn - 1);
+    for (uint i = srcn; i < dstn; i++)
+        tc->vcpu.gpr_file[d_row][i] = sign;
+}
+
 /* ---------- LEA (taint base+index into dst; log index taint to lea.out) ----
  * dst[i] = combine(base[i], index[i]); a NULL base/index maps to the always-
  * clear spare row GRP_NUM. lea.out records the INDEX taint only (the value
@@ -752,8 +783,9 @@ insert_binary(void *dc, instrlist_t *bb, instr_t *instr, int opcode)
     }
 }
 
+/* MOVZX (sign=false) / MOVSX/MOVSXD (sign=true): same shape, different handler. */
 static void
-insert_movzx(void *dc, instrlist_t *bb, instr_t *instr)
+insert_extend(void *dc, instrlist_t *bb, instr_t *instr, bool sign)
 {
     if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 1)
         return;
@@ -768,7 +800,8 @@ insert_movzx(void *dc, instrlist_t *bb, instr_t *instr)
         uint s_row, s_start, s_n;
         if (!reg_shadow_span(opnd_get_reg(s), &s_row, &s_start, &s_n))
             return;
-        dr_insert_clean_call(dc, bb, instr, (void *)movzx_r2r, false, 5,
+        dr_insert_clean_call(dc, bb, instr,
+                             sign ? (void *)movsx_r2r : (void *)movzx_r2r, false, 5,
                              OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(s_row),
                              OPND_CREATE_INT32(s_start), OPND_CREATE_INT32(s_n),
                              OPND_CREATE_INT32(d_n));
@@ -779,10 +812,69 @@ insert_movzx(void *dc, instrlist_t *bb, instr_t *instr)
         mem_ea ea;
         if (!acquire_mem_addr(dc, bb, instr, s, &ea))
             return;
-        dr_insert_clean_call(dc, bb, instr, (void *)movzx_m2r, false, 4,
+        dr_insert_clean_call(dc, bb, instr,
+                             sign ? (void *)movsx_m2r : (void *)movzx_m2r, false, 4,
                              OPND_CREATE_INT32(d_row), opnd_create_reg(ea.addr),
                              OPND_CREATE_INT32(srcn), OPND_CREATE_INT32(d_n));
         release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
+static bool
+is_stack_ptr_reg(reg_id_t r)
+{
+    return r == DR_REG_RSP || r == DR_REG_ESP || r == DR_REG_SP;
+}
+
+/* PUSH reg -> stack slot (r2m); PUSH imm -> clear stack; PUSH mem -> m2m (TODO). */
+static void
+insert_push(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    opnd_t mem;
+    bool havemem = false;
+    for (int k = 0; k < instr_num_dsts(instr); k++) {
+        opnd_t o = instr_get_dst(instr, k);
+        if (opnd_is_memory_reference(o)) { mem = o; havemem = true; break; }
+    }
+    if (!havemem)
+        return;
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_reg(s)) {
+            reg_id_t r = opnd_get_reg(s);
+            if (is_stack_ptr_reg(r))
+                continue;
+            insert_mov_r2m(dc, bb, instr, mem, r);
+            return;
+        }
+        if (opnd_is_immed(s)) {
+            insert_mov_clr_mem(dc, bb, instr, mem);
+            return;
+        }
+        /* memory source (PUSH [mem]) -> m2m: deferred. */
+    }
+}
+
+/* POP -> reg (m2r from stack slot); POP mem -> m2m (TODO). */
+static void
+insert_pop(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    opnd_t mem;
+    bool havemem = false;
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_memory_reference(s)) { mem = s; havemem = true; break; }
+    }
+    if (!havemem)
+        return;
+    for (int k = 0; k < instr_num_dsts(instr); k++) {
+        opnd_t o = instr_get_dst(instr, k);
+        if (opnd_is_reg(o) && reg_is_gpr(opnd_get_reg(o)) &&
+            !is_stack_ptr_reg(opnd_get_reg(o))) {
+            insert_mov_m2r(dc, bb, instr, opnd_get_reg(o), mem);
+            return;
+        }
+        /* memory destination (POP [mem]) -> m2m: deferred. */
     }
 }
 
@@ -966,13 +1058,22 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
             insert_binary(drcontext, bb, instr, op);
             break;
         case OP_movzx:
-            insert_movzx(drcontext, bb, instr);
+            insert_extend(drcontext, bb, instr, false);
+            break;
+        case OP_movsx:
+        case OP_movsxd:
+            insert_extend(drcontext, bb, instr, true);
             break;
         case OP_lea:
             insert_lea(drcontext, bb, instr);
             break;
-        /* 5.1 next: OP_movsx/movsxd (sign-extend; semantics decision pending),
-         * OP_cmps (m2m), OP_push/pop/leave. */
+        case OP_push:
+            insert_push(drcontext, bb, instr);
+            break;
+        case OP_pop:
+            insert_pop(drcontext, bb, instr);
+            break;
+        /* 5.1 next: OP_cmps (m2m), OP_leave, PUSH/POP mem (m2m). */
         default:
             break;  /* no propagation yet */
     }
