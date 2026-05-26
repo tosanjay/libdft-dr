@@ -90,4 +90,8 @@ void libdft_setup(void);	/* register drmgr/drreg + all events */
 void libdft_die(void);
 void finish(void);		/* flush + close output, dump telemetry */
 
+/* Per-thread context for the calling thread (drwrap/clean-call callbacks).
+ * Returns NULL before the thread-init event has run. */
+thread_ctx_t *libdft_get_thread_ctx(void *drcontext);
+
 #endif /* __LIBDFT_API_DR_H__ */

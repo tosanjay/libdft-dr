@@ -33,7 +33,9 @@ add_library(libdft-dta-dr SHARED
     syscall_desc_dr.cpp
     tagmap.cpp
     osutils_dr.cpp
-    mnt_consumer_dr.cpp)
+    mnt_consumer_dr.cpp
+    sdft_summaries_dr.cpp
+    sdft_hook_dr.cpp)
 target_include_directories(libdft-dta-dr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 configure_DynamoRIO_client(libdft-dta-dr)
 foreach (ext drmgr drreg drx drwrap drsyms drutil)

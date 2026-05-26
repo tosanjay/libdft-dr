@@ -9,6 +9,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 #include "dr_api.h"
 #include "drmgr.h"
@@ -20,6 +23,7 @@
 #include "branch_pred.h"
 #include "libdft_log.h"
 #include "mnt_consumer_dr.h"
+#include "sdft_hook_dr.h"
 
 /* cmp.out / lea.out outputs (empty in Phase 2; DR file handles). */
 file_t out = INVALID_FILE;
@@ -39,6 +43,14 @@ static inline thread_ctx_t *
 cur_thread_ctx(void *drcontext)
 {
 	return (thread_ctx_t *)drmgr_get_tls_field(drcontext, tls_idx);
+}
+
+thread_ctx_t *
+libdft_get_thread_ctx(void *drcontext)
+{
+	if (tls_idx == -1)
+		return NULL;
+	return cur_thread_ctx(drcontext);
 }
 
 /*
@@ -146,14 +158,16 @@ finish(void)
 		dr_close_file(out_lea);
 	dr_fprintf(STDERR, "[libdft-dr] taint sources: %llu events, %llu bytes painted\n",
 		   g_src_events, g_src_bytes);
-	/* C.2 telemetry */
+	/* C.2 / C.3 telemetry */
 	mnt::log_summary();
+	sdft_hook::log_summary();
 }
 
 static void
 event_exit(void)
 {
 	finish();
+	sdft_hook::shutdown();
 	drmgr_unregister_tls_field(tls_idx);
 	drmgr_unregister_thread_init_event(event_thread_init);
 	drmgr_unregister_thread_exit_event(event_thread_exit);
@@ -188,6 +202,22 @@ libdft_setup(void)
 	/* C.2 static MNT subsystem (registers its own module load/unload events;
 	 * no-op if VUZZER_MNT_POLICY=off). */
 	(void)mnt::init();
+
+	/* C.3 function-summary subsystem. Conf path resolution mirrors the Pin
+	 * engine: $VUZZER_SDFT_CONF, else ../fuzzer-code/libc_summaries.conf.
+	 * Set VUZZER_SDFT=off to skip. */
+	{
+		const char *off = std::getenv("VUZZER_SDFT");
+		if (off == NULL || std::strcmp(off, "off") != 0) {
+			const char *conf_env = std::getenv("VUZZER_SDFT_CONF");
+			std::string conf = (conf_env != NULL && std::strlen(conf_env) > 0)
+				? std::string(conf_env)
+				: std::string("../fuzzer-code/libc_summaries.conf");
+			(void)sdft_hook::init(conf);
+		} else {
+			dr_fprintf(STDERR, "[sdft_hook] disabled (VUZZER_SDFT=off)\n");
+		}
+	}
 
 	dr_register_exit_event(event_exit);
 }
