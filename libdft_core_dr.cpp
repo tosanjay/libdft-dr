@@ -154,6 +154,28 @@ emit_cmp(std::vector<std::string> &o)
     dr_write_file(out, line.data(), line.size());
 }
 
+/* print_lea_log: 10 fields, filter [2..9], same trailing-space + '\n' layout.
+ * Field [0]=width, [1]="baseidx", [2..9]=index-byte tags. (libdft writes the
+ * ins address to [2] but immediately clobbers it with the i=0 index tag, so it
+ * never appears -- we omit it, matching the on-disk format read_lea expects.) */
+static void
+emit_lea(std::vector<std::string> &o)
+{
+    if (out_lea == INVALID_FILE)
+        return;
+    for (int i = 2; i < 10; i++) {
+        if (comma_tokens(o[i]) > limit_offset)
+            return;
+    }
+    std::string line;
+    for (int i = 0; i < 10; i++) {
+        line += o[i];
+        line += ' ';
+    }
+    line += '\n';
+    dr_write_file(out_lea, line.data(), line.size());
+}
+
 /* read `size` byte-tags from a register span into v (size guaranteed <= 8). */
 static void
 fill_reg_tags(thread_ctx_t *tc, uint row, uint start, uint size,
@@ -309,6 +331,39 @@ movzx_m2r(uint d_row, ADDRINT addr, uint srcn, uint dstn)
         tc->vcpu.gpr_file[d_row][i] = file_tagmap_getb(addr + i);
     for (uint i = srcn; i < dstn; i++)
         tc->vcpu.gpr_file[d_row][i] = tag_traits<tag_t>::cleared_val;
+}
+
+/* ---------- LEA (taint base+index into dst; log index taint to lea.out) ----
+ * dst[i] = combine(base[i], index[i]); a NULL base/index maps to the always-
+ * clear spare row GRP_NUM. lea.out records the INDEX taint only (the value
+ * VUzzer uses to find offsets that index into tainted structures). */
+static void
+lea_prop(ptr_uint_t ins, uint dst_row, uint base_row, uint base_start,
+         uint idx_row, uint idx_start, uint size)
+{
+    (void)ins;
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+
+    std::vector<std::string> o(10, "{}");
+    o[0] = int2str((int)size * 8);
+    o[1] = "baseidx";
+    int fl = 0;
+    for (uint i = 0; i < size; i++) {
+        tag_t it = tc->vcpu.gpr_file[idx_row][idx_start + i];
+        if (tag_count(it))
+            fl = 1;
+        o[i + 2] = tag_sprint(it);
+    }
+    if (fl)
+        emit_lea(o);
+
+    for (uint i = 0; i < size; i++) {
+        tag_t b = tc->vcpu.gpr_file[base_row][base_start + i];
+        tag_t x = tc->vcpu.gpr_file[idx_row][idx_start + i];
+        tc->vcpu.gpr_file[dst_row][i] = tag_combine(b, x);
+    }
 }
 
 /* ---------- CMP -> cmp.out handlers (clean calls) ---------- */
@@ -731,6 +786,46 @@ insert_movzx(void *dc, instrlist_t *bb, instr_t *instr)
     }
 }
 
+/* (row,start) for an address register, mapping NULL/non-GPR to the clear row. */
+static void
+addr_reg_span(reg_id_t reg, uint *row, uint *start)
+{
+    uint r, s, n;
+    if (reg != DR_REG_NULL && reg_shadow_span(reg, &r, &s, &n)) {
+        *row = r;
+        *start = s;
+    } else {
+        *row = GRP_NUM;
+        *start = 0;
+    }
+}
+
+static void
+insert_lea(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (!opnd_is_reg(d))
+        return;
+    uint d_row, d_start, d_n;
+    if (!reg_shadow_span(opnd_get_reg(d), &d_row, &d_start, &d_n))
+        return;
+    opnd_t mem = instr_get_src(instr, 0);
+    if (!opnd_is_base_disp(mem))
+        return;
+    uint b_row, b_start, i_row, i_start;
+    addr_reg_span(opnd_get_base(mem), &b_row, &b_start);
+    addr_reg_span(opnd_get_index(mem), &i_row, &i_start);
+    app_pc pc = instr_get_app_pc(instr);
+    dr_insert_clean_call(dc, bb, instr, (void *)lea_prop, false, 7,
+                         OPND_CREATE_INTPTR((ptr_int_t)pc),
+                         OPND_CREATE_INT32(d_row),
+                         OPND_CREATE_INT32(b_row), OPND_CREATE_INT32(b_start),
+                         OPND_CREATE_INT32(i_row), OPND_CREATE_INT32(i_start),
+                         OPND_CREATE_INT32(d_n));
+}
+
 static void
 insert_cmp(void *dc, instrlist_t *bb, instr_t *instr)
 {
@@ -873,8 +968,11 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
         case OP_movzx:
             insert_movzx(drcontext, bb, instr);
             break;
+        case OP_lea:
+            insert_lea(drcontext, bb, instr);
+            break;
         /* 5.1 next: OP_movsx/movsxd (sign-extend; semantics decision pending),
-         * OP_cmps (m2m), OP_push/pop/leave, OP_lea (lea.out). */
+         * OP_cmps (m2m), OP_push/pop/leave. */
         default:
             break;  /* no propagation yet */
     }
