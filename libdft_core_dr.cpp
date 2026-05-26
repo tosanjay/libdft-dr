@@ -267,6 +267,79 @@ m2m_xfer(ADDRINT dst_addr, ADDRINT src_addr, uint n)
         tagmap_setb_with_tag(dst_addr + i, file_tagmap_getb(src_addr + i));
 }
 
+/* ---------- ternary combine (MUL/DIV/IDIV/IMUL 1-operand form) ----------
+ * RDX:RAX (or AX for byte) <- accumulator (combined) op the single operand.
+ * Taint: combine the operand's byte tags into both RAX and RDX over the width
+ * (byte form: into RAX[0],RAX[1] only -- AX = AL * src8). */
+static void
+ternary_combine(thread_ctx_t *tc, const tag_t *src, uint n)
+{
+    if (n == 1) {
+        tc->vcpu.gpr_file[DFT_REG_RAX][0] =
+            tag_combine(tc->vcpu.gpr_file[DFT_REG_RAX][0], const_cast<tag_t &>(src[0]));
+        tc->vcpu.gpr_file[DFT_REG_RAX][1] =
+            tag_combine(tc->vcpu.gpr_file[DFT_REG_RAX][1], const_cast<tag_t &>(src[0]));
+        return;
+    }
+    for (uint i = 0; i < n; i++) {
+        tc->vcpu.gpr_file[DFT_REG_RDX][i] =
+            tag_combine(tc->vcpu.gpr_file[DFT_REG_RDX][i], const_cast<tag_t &>(src[i]));
+        tc->vcpu.gpr_file[DFT_REG_RAX][i] =
+            tag_combine(tc->vcpu.gpr_file[DFT_REG_RAX][i], const_cast<tag_t &>(src[i]));
+    }
+}
+
+static void
+ternary_r2r(uint s_row, uint s_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    tag_t src[8];
+    for (uint i = 0; i < n && i < 8; i++)
+        src[i] = tc->vcpu.gpr_file[s_row][s_start + i];
+    ternary_combine(tc, src, n);
+}
+
+static void
+ternary_m2r(ADDRINT addr, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    tag_t src[8];
+    for (uint i = 0; i < n && i < 8; i++)
+        src[i] = file_tagmap_getb(addr + i);
+    ternary_combine(tc, src, n);
+}
+
+/* ---------- XCHG (swap byte-tags) ---------- */
+static void
+xchg_r2r(uint a_row, uint a_start, uint b_row, uint b_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t t = tc->vcpu.gpr_file[a_row][a_start + i];
+        tc->vcpu.gpr_file[a_row][a_start + i] = tc->vcpu.gpr_file[b_row][b_start + i];
+        tc->vcpu.gpr_file[b_row][b_start + i] = t;
+    }
+}
+
+static void
+xchg_m2r(ADDRINT addr, uint row, uint start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t r = tc->vcpu.gpr_file[row][start + i];
+        tc->vcpu.gpr_file[row][start + i] = file_tagmap_getb(addr + i);
+        tagmap_setb_with_tag(addr + i, r);
+    }
+}
+
 /* ---------- binary combine handlers (ADD/AND/OR/XOR/SBB/SUB) ----------
  * Arithmetic/logical RMW mixes operand taint: dst[i] = combine(dst[i], src[i])
  * (EWAH union). The immediate-source forms carry no taint and are not
@@ -1051,6 +1124,163 @@ insert_leave(void *dc, instrlist_t *bb, instr_t *instr)
     }
 }
 
+/* BSF/BSR: libdft treats these as a plain MOV (dst reg <- src reg/mem). */
+static void
+insert_xfer(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (!opnd_is_reg(d))
+        return;
+    opnd_t s = instr_get_src(instr, 0);
+    if (opnd_is_reg(s))
+        insert_r2r_xfer(dc, bb, instr, opnd_get_reg(d), opnd_get_reg(s));
+    else if (opnd_is_memory_reference(s))
+        insert_mov_m2r(dc, bb, instr, opnd_get_reg(d), s);
+}
+
+/* fixed-register byte-span copy (sign-extend accumulator ops CBW..CQO). */
+static void
+insert_fixed_xfer(void *dc, instrlist_t *bb, instr_t *instr, uint d_row,
+                  uint d_start, uint s_row, uint s_start, uint n)
+{
+    dr_insert_clean_call(dc, bb, instr, (void *)r2r_xfer, false, 5,
+                         OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(d_start),
+                         OPND_CREATE_INT32(s_row), OPND_CREATE_INT32(s_start),
+                         OPND_CREATE_INT32(n));
+}
+
+/* CBW/CWDE/CDQE (DR OP_cwde): sign-extend the accumulator in place. The dst
+ * width (2/4/8) selects which: copy RAX[0..half-1] -> RAX[half..size-1]. */
+static void
+insert_cwde_family(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1 || !opnd_is_reg(instr_get_dst(instr, 0)))
+        return;
+    uint size = (uint)opnd_size_in_bytes(opnd_get_size(instr_get_dst(instr, 0)));
+    if (size < 2)
+        return;
+    uint half = size / 2;
+    insert_fixed_xfer(dc, bb, instr, DFT_REG_RAX, half, DFT_REG_RAX, 0, half);
+}
+
+/* CWD/CDQ/CQO (DR OP_cdq): RDX <- sign of rAX at the operand width. */
+static void
+insert_cdq_family(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1 || !opnd_is_reg(instr_get_dst(instr, 0)))
+        return;
+    uint size = (uint)opnd_size_in_bytes(opnd_get_size(instr_get_dst(instr, 0)));
+    if (size == 0)
+        return;
+    insert_fixed_xfer(dc, bb, instr, DFT_REG_RDX, 0, DFT_REG_RAX, 0, size);
+}
+
+/* the single explicit reg/mem operand of MUL/DIV/IDIV (skip the implicit
+ * RAX/RDX). Returns false if only the accumulator is involved. */
+static bool
+find_explicit_operand(instr_t *instr, opnd_t *out)
+{
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t o = instr_get_src(instr, k);
+        if (opnd_is_memory_reference(o)) { *out = o; return true; }
+        if (opnd_is_reg(o)) {
+            reg_id_t full = reg_to_pointer_sized(opnd_get_reg(o));
+            if (full != DR_REG_RAX && full != DR_REG_RDX) { *out = o; return true; }
+        }
+    }
+    return false;
+}
+
+/* MUL/DIV/IDIV (1-operand): RDX:RAX combine with the explicit operand. */
+static void
+insert_muldiv(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    opnd_t e;
+    if (!find_explicit_operand(instr, &e))
+        return;
+    if (opnd_is_reg(e)) {
+        uint row, start, n;
+        if (!reg_shadow_span(opnd_get_reg(e), &row, &start, &n))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)ternary_r2r, false, 3,
+                             OPND_CREATE_INT32(row), OPND_CREATE_INT32(start),
+                             OPND_CREATE_INT32(n));
+    } else if (opnd_is_memory_reference(e)) {
+        uint n = (uint)opnd_size_in_bytes(opnd_get_size(e));
+        if (n == 0)
+            return;
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, e, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)ternary_m2r, false, 2,
+                             opnd_create_reg(ea.addr), OPND_CREATE_INT32(n));
+        release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
+/* IMUL: 1-operand form (RDX:RAX dsts) -> ternary; 2-operand form -> binary
+ * combine (handled by insert_binary). 3-operand (dst,src,imm) is approximated
+ * by insert_binary as well (over-combines into dst -- acceptable). */
+static void
+insert_imul(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    bool has_rax = false, has_rdx = false;
+    for (int k = 0; k < instr_num_dsts(instr); k++) {
+        opnd_t o = instr_get_dst(instr, k);
+        if (opnd_is_reg(o) && reg_is_gpr(opnd_get_reg(o))) {
+            reg_id_t full = reg_to_pointer_sized(opnd_get_reg(o));
+            if (full == DR_REG_RAX) has_rax = true;
+            if (full == DR_REG_RDX) has_rdx = true;
+        }
+    }
+    if (has_rax && has_rdx)
+        insert_muldiv(dc, bb, instr);   /* 1-operand form */
+    else
+        insert_binary(dc, bb, instr, OP_imul);
+}
+
+/* XCHG: swap byte-tags (reg<->reg or reg<->mem). */
+static void
+insert_xchg(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    opnd_t r0, r1, mem;
+    int nreg = 0, nmem = 0;
+    /* collect the two data operands from the dst list (XCHG writes both). */
+    for (int k = 0; k < instr_num_dsts(instr); k++) {
+        opnd_t o = instr_get_dst(instr, k);
+        if (opnd_is_reg(o) && reg_is_gpr(opnd_get_reg(o))) {
+            if (nreg == 0) r0 = o; else r1 = o;
+            nreg++;
+        } else if (opnd_is_memory_reference(o)) {
+            mem = o; nmem++;
+        }
+    }
+    if (nmem == 0 && nreg >= 2) {
+        uint a_row, a_start, a_n, b_row, b_start, b_n;
+        if (!reg_shadow_span(opnd_get_reg(r0), &a_row, &a_start, &a_n) ||
+            !reg_shadow_span(opnd_get_reg(r1), &b_row, &b_start, &b_n))
+            return;
+        uint n = (a_n < b_n) ? a_n : b_n;
+        dr_insert_clean_call(dc, bb, instr, (void *)xchg_r2r, false, 5,
+                             OPND_CREATE_INT32(a_row), OPND_CREATE_INT32(a_start),
+                             OPND_CREATE_INT32(b_row), OPND_CREATE_INT32(b_start),
+                             OPND_CREATE_INT32(n));
+    } else if (nmem == 1 && nreg >= 1) {
+        uint row, start, n;
+        if (!reg_shadow_span(opnd_get_reg(r0), &row, &start, &n))
+            return;
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, mem, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)xchg_m2r, false, 4,
+                             opnd_create_reg(ea.addr), OPND_CREATE_INT32(row),
+                             OPND_CREATE_INT32(start), OPND_CREATE_INT32(n));
+        release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
 /* (row,start) for an address register, mapping NULL/non-GPR to the clear row. */
 static void
 addr_reg_span(reg_id_t reg, uint *row, uint *start)
@@ -1252,6 +1482,30 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
         case OP_leave:
             insert_leave(drcontext, bb, instr);
             break;
+        case OP_bsf:
+        case OP_bsr:
+            insert_xfer(drcontext, bb, instr);  /* libdft: MOV-like transfer */
+            break;
+        case OP_cwde: /* CBW/CWDE/CDQE: RAX sign-extend in place */
+            insert_cwde_family(drcontext, bb, instr);
+            break;
+        case OP_cdq:  /* CWD/CDQ/CQO: RDX <- sign of rAX */
+            insert_cdq_family(drcontext, bb, instr);
+            break;
+        case OP_mul:
+        case OP_div:
+        case OP_idiv:
+            insert_muldiv(drcontext, bb, instr);
+            break;
+        case OP_imul:
+            insert_imul(drcontext, bb, instr);
+            break;
+        case OP_xchg:
+            insert_xchg(drcontext, bb, instr);
+            break;
+        /* deferred (predicated/conditional -> false-positive risk, or REP/
+         * sdft-covered): CMOV*, CMPXCHG, XADD, string MOVS/STOS/LODS/SCAS.
+         * No-op in libdft too: shift/rotate family. */
         default:
             break;  /* no propagation yet */
     }
