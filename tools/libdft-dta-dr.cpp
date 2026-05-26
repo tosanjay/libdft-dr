@@ -1,18 +1,23 @@
 /* libdft-dta-dr -- DynamoRIO port of libdft64's taint tracker (C.4).
  *
- * PHASE 0 STUB. No taint propagation, no syscall hooks, no opcode handlers.
- * It only stands up the DR client lifecycle (drmgr + drreg) and the two
- * output-file knobs (-o cmp.out, -leao lea.out) so the runfuzzer --mode dr
- * taint path round-trips and produces empty-but-present output files.
+ * PHASE 2: source-painting foundation. Hooks the input-read syscalls
+ * (read, pread64, open, openat, dup, close, mmap, munmap), paints shadow at
+ * taint sources exactly as the Pin engine does, and tears down cleanly. There
+ * are NO opcode handlers yet, so cmp.out / lea.out are created but stay empty.
+ * Opcode-level taint propagation arrives in Phases 3-5.
  *
- * The canonical engine remains libdft64/ (Pin). This tree is filled in
- * across Phases 2-5 of c4_dr_port_plan.md; until then it is a no-op.
+ * The canonical engine remains libdft64/ (Pin); that tree is the A/B baseline.
+ *
+ * Options (kept byte-compatible with the Pin tool's KNOBs and runfuzzer's
+ * DRTNTCMD): -o <cmp.out> -leao <lea.out> -filename <path> -x <timeout-secs>.
+ * The maxoff/mmap knobs default to the Pin values (4, 1).
  */
 #include <string>
 #include "dr_api.h"
-#include "drmgr.h"
-#include "drreg.h"
 #include "droption.h"
+
+#include "libdft_api_dr.h"
+#include "osutils_dr.h"
 
 using namespace dynamorio::droption;
 
@@ -26,35 +31,28 @@ static droption_t<std::string> op_filename(
     DROPTION_SCOPE_CLIENT, "filename", "", "Tainted input filename",
     "Input file whose bytes are taint sources.");
 static droption_t<int> op_timeout(
-    DROPTION_SCOPE_CLIENT, "x", 0, "Per-input timeout (seconds)",
-    "Watchdog timeout; 0 disables. Parsed for parity with the Pin tool.");
+    DROPTION_SCOPE_CLIENT, "x", 0, "Watchdog timeout (seconds)",
+    "Kill the app after this many seconds; 0 disables. The Python run() "
+    "wrapper is the primary timeout enforcer.");
+static droption_t<int> op_maxoff(
+    DROPTION_SCOPE_CLIENT, "maxoff", 4, "Tracked taint width per byte",
+    "How many bytes of taint to track per byte (Pin default 4).");
+static droption_t<int> op_mmap(
+    DROPTION_SCOPE_CLIENT, "mmap", 1, "mmap taint-spread method",
+    "Method used to spread taint through mmap (Pin default 1).");
 
 static void
-truncate_output(const std::string &path)
+watchdog_thread(void *arg)
 {
-    if (path.empty())
-        return;
-    file_t f = dr_open_file(path.c_str(), DR_FILE_WRITE_OVERWRITE);
-    if (f != INVALID_FILE)
-        dr_close_file(f);
-}
-
-static void
-event_exit(void)
-{
-    /* Phase 0: emit empty output files so the Python parser sees a
-     * present-but-empty cmp.out/lea.out (read_taint treats that as
-     * "no taint", which is the correct no-op semantics). */
-    truncate_output(op_cmpfile.get_value());
-    truncate_output(op_leafile.get_value());
-    drreg_exit();
-    drmgr_exit();
+    dr_client_thread_set_suspendable(false);
+    dr_sleep((uint64)op_timeout.get_value() * 1000); /* seconds -> ms */
+    dr_exit_process(0);
 }
 
 DR_EXPORT void
 dr_client_main(client_id_t id, int argc, const char *argv[])
 {
-    dr_set_client_name("libdft-dta-dr (Phase 0 stub)",
+    dr_set_client_name("libdft-dta-dr (Phase 2: source painting)",
                        "https://github.com/tosanjay/vuzzer64-v2");
     std::string parse_err;
     if (!droption_parser_t::parse_argv(DROPTION_SCOPE_CLIENT, argc, argv,
@@ -62,8 +60,19 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
         dr_fprintf(STDERR, "[libdft-dta-dr] option parse error: %s\n",
                    parse_err.c_str());
     }
-    drmgr_init();
-    drreg_options_t ops = { sizeof(ops), 3 /*max slots*/, false };
-    drreg_init(&ops);
-    dr_register_exit_event(event_exit);
+
+    /* cmp.out / lea.out: truncate to empty (Phase 2 emits no records, but the
+     * Python read_taint() expects the files to exist). DR file API -- see the
+     * note in libdft_api_dr.h on why not std::ofstream. */
+    out = dr_open_file(op_cmpfile.get_value().c_str(), DR_FILE_WRITE_OVERWRITE);
+    out_lea = dr_open_file(op_leafile.get_value().c_str(), DR_FILE_WRITE_OVERWRITE);
+
+    filename = op_filename.get_value();
+    limit_offset = op_maxoff.get_value();
+    mmap_type = (op_mmap.get_value() != 0);
+
+    libdft_setup();
+
+    if (op_timeout.get_value() > 0)
+        dr_create_client_thread(watchdog_thread, NULL);
 }
