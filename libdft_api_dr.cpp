@@ -19,6 +19,7 @@
 #include "tagmap.h"
 #include "branch_pred.h"
 #include "libdft_log.h"
+#include "mnt_consumer_dr.h"
 
 /* cmp.out / lea.out outputs (empty in Phase 2; DR file handles). */
 file_t out = INVALID_FILE;
@@ -145,6 +146,8 @@ finish(void)
 		dr_close_file(out_lea);
 	dr_fprintf(STDERR, "[libdft-dr] taint sources: %llu events, %llu bytes painted\n",
 		   g_src_events, g_src_bytes);
+	/* C.2 telemetry */
+	mnt::log_summary();
 }
 
 static void
@@ -181,6 +184,10 @@ libdft_setup(void)
 	dr_register_filter_syscall_event(event_filter_syscall);
 	drmgr_register_pre_syscall_event(event_pre_syscall);
 	drmgr_register_post_syscall_event(event_post_syscall);
+
+	/* C.2 static MNT subsystem (registers its own module load/unload events;
+	 * no-op if VUZZER_MNT_POLICY=off). */
+	(void)mnt::init();
 
 	dr_register_exit_event(event_exit);
 }
