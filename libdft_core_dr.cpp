@@ -237,6 +237,80 @@ mov_clr_mem(ADDRINT addr, uint n)
     file_tagmap_clrn(addr, n);
 }
 
+/* ---------- binary combine handlers (ADD/AND/OR/XOR/SBB/SUB) ----------
+ * Arithmetic/logical RMW mixes operand taint: dst[i] = combine(dst[i], src[i])
+ * (EWAH union). The immediate-source forms carry no taint and are not
+ * instrumented; the XOR/SUB/SBB same-register zeroing idiom is turned into a
+ * clear at instrument time (see insert_binary). */
+static void
+binary_r2r(uint d_row, uint d_start, uint s_row, uint s_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < n; i++)
+        tc->vcpu.gpr_file[d_row][d_start + i] =
+            tag_combine(tc->vcpu.gpr_file[d_row][d_start + i],
+                        tc->vcpu.gpr_file[s_row][s_start + i]);
+}
+
+/* dst reg, src mem (e.g. ADD reg,[mem]). */
+static void
+binary_m2r(uint d_row, uint d_start, ADDRINT addr, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t m = file_tagmap_getb(addr + i);
+        tc->vcpu.gpr_file[d_row][d_start + i] =
+            tag_combine(tc->vcpu.gpr_file[d_row][d_start + i], m);
+    }
+}
+
+/* dst mem, src reg (e.g. ADD [mem],reg). */
+static void
+binary_r2m(ADDRINT addr, uint s_row, uint s_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t cur = file_tagmap_getb(addr + i);
+        tag_t s = tc->vcpu.gpr_file[s_row][s_start + i];
+        tagmap_setb_with_tag(addr + i, tag_combine(cur, s));
+    }
+}
+
+/* ---------- MOVZX (zero-extend) ----------
+ * Principled semantics: copy the source byte-tags, then CLEAR the
+ * zero-extension region. (libdft's size-specialized _movzx_* handlers are
+ * buggy -- several leave the extension bytes uncleared, producing stale/false
+ * taint; the DR port fixes this. See arch-doc D27.) */
+static void
+movzx_r2r(uint d_row, uint s_row, uint s_start, uint srcn, uint dstn)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < srcn; i++)
+        tc->vcpu.gpr_file[d_row][i] = tc->vcpu.gpr_file[s_row][s_start + i];
+    for (uint i = srcn; i < dstn; i++)
+        tc->vcpu.gpr_file[d_row][i] = tag_traits<tag_t>::cleared_val;
+}
+
+static void
+movzx_m2r(uint d_row, ADDRINT addr, uint srcn, uint dstn)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL)
+        return;
+    for (uint i = 0; i < srcn; i++)
+        tc->vcpu.gpr_file[d_row][i] = file_tagmap_getb(addr + i);
+    for (uint i = srcn; i < dstn; i++)
+        tc->vcpu.gpr_file[d_row][i] = tag_traits<tag_t>::cleared_val;
+}
+
 /* ---------- CMP -> cmp.out handlers (clean calls) ---------- */
 
 static void
@@ -528,6 +602,135 @@ insert_mov_clr_mem(void *dc, instrlist_t *bb, instr_t *instr, opnd_t mem)
     release_mem_addr(dc, bb, instr, &ea);
 }
 
+/* the data destination of an RMW op (first GPR or memory dst, skipping eflags) */
+static bool
+find_data_dst(instr_t *instr, opnd_t *out)
+{
+    for (int k = 0; k < instr_num_dsts(instr); k++) {
+        opnd_t o = instr_get_dst(instr, k);
+        if (opnd_is_memory_reference(o) ||
+            (opnd_is_reg(o) && reg_is_gpr(opnd_get_reg(o)))) {
+            *out = o;
+            return true;
+        }
+    }
+    return false;
+}
+
+/* whether a source operand is the same datum as the RMW destination (so it can
+ * be skipped when locating the "other" operand that contributes taint). */
+static bool
+same_data_opnd(opnd_t a, opnd_t b)
+{
+    if (opnd_is_reg(a) && opnd_is_reg(b))
+        return opnd_get_reg(a) == opnd_get_reg(b);
+    if (opnd_is_memory_reference(a) && opnd_is_memory_reference(b))
+        return true;
+    return false;
+}
+
+static void
+insert_binary(void *dc, instrlist_t *bb, instr_t *instr, int opcode)
+{
+    opnd_t op0;
+    if (!find_data_dst(instr, &op0))
+        return;
+
+    /* the taint-source operand = first src that isn't the RMW dst-as-src */
+    opnd_t op1 = op0;
+    bool have1 = false;
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_immed(s)) { op1 = s; have1 = true; break; }
+        if (same_data_opnd(s, op0))
+            continue;
+        op1 = s; have1 = true; break;
+    }
+    (void)have1;  /* !have1 => same-register operand (op1 == op0) */
+
+    if (opnd_is_immed(op1))
+        return;  /* immediate carries no taint */
+
+    /* XOR/SUB/SBB reg,reg same register => zeroing idiom => clear dst. */
+    if ((opcode == OP_xor || opcode == OP_sub || opcode == OP_sbb) &&
+        opnd_is_reg(op0) && opnd_is_reg(op1) &&
+        opnd_get_reg(op0) == opnd_get_reg(op1)) {
+        insert_r_clr(dc, bb, instr, opnd_get_reg(op0));
+        return;
+    }
+
+    if (opnd_is_reg(op0)) {
+        uint d_row, d_start, d_n;
+        if (!reg_shadow_span(opnd_get_reg(op0), &d_row, &d_start, &d_n))
+            return;
+        if (opnd_is_reg(op1)) {
+            uint s_row, s_start, s_n;
+            if (!reg_shadow_span(opnd_get_reg(op1), &s_row, &s_start, &s_n))
+                return;
+            uint n = (d_n < s_n) ? d_n : s_n;
+            dr_insert_clean_call(dc, bb, instr, (void *)binary_r2r, false, 5,
+                                 OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(d_start),
+                                 OPND_CREATE_INT32(s_row), OPND_CREATE_INT32(s_start),
+                                 OPND_CREATE_INT32(n));
+        } else if (opnd_is_memory_reference(op1)) {
+            mem_ea ea;
+            if (!acquire_mem_addr(dc, bb, instr, op1, &ea))
+                return;
+            dr_insert_clean_call(dc, bb, instr, (void *)binary_m2r, false, 4,
+                                 OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(d_start),
+                                 opnd_create_reg(ea.addr), OPND_CREATE_INT32(d_n));
+            release_mem_addr(dc, bb, instr, &ea);
+        }
+    } else if (opnd_is_memory_reference(op0)) {
+        if (!opnd_is_reg(op1))
+            return;
+        uint s_row, s_start, s_n;
+        if (!reg_shadow_span(opnd_get_reg(op1), &s_row, &s_start, &s_n))
+            return;
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, op0, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)binary_r2m, false, 4,
+                             opnd_create_reg(ea.addr), OPND_CREATE_INT32(s_row),
+                             OPND_CREATE_INT32(s_start), OPND_CREATE_INT32(s_n));
+        release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
+static void
+insert_movzx(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (!opnd_is_reg(d))
+        return;
+    uint d_row, d_start, d_n;
+    if (!reg_shadow_span(opnd_get_reg(d), &d_row, &d_start, &d_n))
+        return;
+    opnd_t s = instr_get_src(instr, 0);
+    if (opnd_is_reg(s)) {
+        uint s_row, s_start, s_n;
+        if (!reg_shadow_span(opnd_get_reg(s), &s_row, &s_start, &s_n))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)movzx_r2r, false, 5,
+                             OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(s_row),
+                             OPND_CREATE_INT32(s_start), OPND_CREATE_INT32(s_n),
+                             OPND_CREATE_INT32(d_n));
+    } else if (opnd_is_memory_reference(s)) {
+        uint srcn = (uint)opnd_size_in_bytes(opnd_get_size(s));
+        if (srcn == 0)
+            return;
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, s, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)movzx_m2r, false, 4,
+                             OPND_CREATE_INT32(d_row), opnd_create_reg(ea.addr),
+                             OPND_CREATE_INT32(srcn), OPND_CREATE_INT32(d_n));
+        release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
 static void
 insert_cmp(void *dc, instrlist_t *bb, instr_t *instr)
 {
@@ -659,8 +862,19 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
         case OP_cmp:
             insert_cmp(drcontext, bb, instr);
             break;
-        /* 5.1 next: OP_cmps (m2m), OP_movzx/movsx, OP_add/sub/and/or/xor,
-         * OP_push/pop, OP_lea (lea.out). */
+        case OP_add:
+        case OP_and:
+        case OP_or:
+        case OP_xor:
+        case OP_sub:
+        case OP_sbb:
+            insert_binary(drcontext, bb, instr, op);
+            break;
+        case OP_movzx:
+            insert_movzx(drcontext, bb, instr);
+            break;
+        /* 5.1 next: OP_movsx/movsxd (sign-extend; semantics decision pending),
+         * OP_cmps (m2m), OP_push/pop/leave, OP_lea (lea.out). */
         default:
             break;  /* no propagation yet */
     }
