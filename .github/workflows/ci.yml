@@ -45,6 +45,7 @@ jobs:
           cd ~
           curl -fLO "${{ env.DR_URL }}"
           tar xzf "${{ env.DR_TARBALL }}"
+          rm -f "${{ env.DR_TARBALL }}"   # else the glob below matches both
           # Tarball extracts to "DynamoRIO-Linux-<version>" or
           # "DynamoRIO-Linux-<version>-<build>" depending on the release;
           # match the actual extracted dir via shell glob.
