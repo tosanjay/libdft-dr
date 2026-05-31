@@ -83,6 +83,12 @@ typedef struct {
 	vcpu_ctx_t	vcpu;
 	syscall_ctx_t	syscall_ctx;
 	UINT32		syscall_nr;
+	/* M7 prep (v0.2 DFPG): over-approximate register-taint bitmask.
+	 * Bit row N set iff gpr_file[N][*] might contain a non-empty tag.
+	 * In v0.1 this is recomputed on demand (libdft_compute_gpr_mask);
+	 * v0.2's DFPG will add incremental updates from the per-insn handlers
+	 * once the access patterns are pinned down by drbbdup integration. */
+	UINT32		gpr_mask_cached;	/* v0.1: unused, zero. v0.2: cached. */
 } thread_ctx_t;
 
 /* libdft API */
@@ -93,5 +99,26 @@ void finish(void);		/* flush + close output, dump telemetry */
 /* Per-thread context for the calling thread (drwrap/clean-call callbacks).
  * Returns NULL before the thread-init event has run. */
 thread_ctx_t *libdft_get_thread_ctx(void *drcontext);
+
+/* M7 prep (v0.2 DFPG groundwork): compute the over-approximate GPR taint
+ * bitmask from current shadow state. Bit N set iff gpr_file[N][0..7] has
+ * any non-empty tag. Cost: 16 * 8 = 128 cell reads; called at most once
+ * per BB-entry dispatch (rare relative to per-insn work). The cached
+ * thread_ctx_t::gpr_mask_cached field is reserved for the v0.2
+ * incremental-update path. */
+static inline UINT32
+libdft_compute_gpr_mask(const thread_ctx_t *tc)
+{
+	UINT32 m = 0;
+	for (unsigned row = DFT_REG_RDI; row <= DFT_REG_R15; ++row) {
+		for (unsigned b = 0; b < 8; ++b) {
+			if (tc->vcpu.gpr_file[row][b].id != 0) {
+				m |= (1u << row);
+				break;
+			}
+		}
+	}
+	return m;
+}
 
 #endif /* __LIBDFT_API_DR_H__ */
