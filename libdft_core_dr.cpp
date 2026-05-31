@@ -2154,22 +2154,6 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
 
 /* ---------- BB instrumentation event ---------- */
 
-/* App2app pass: rewrite REP-prefixed string ops so the inner MOVS/STOS/
- * LODS/SCAS becomes a regular instruction inside a synthetic loop. Required
- * for the M1.4 string-op handlers to fire per iteration. */
-static dr_emit_flags_t
-event_bb_app2app(void *drcontext, void *tag, instrlist_t *bb,
-                 bool for_trace, bool translating)
-{
-    /* Expand REP-prefixed string ops. We DON'T assert on failure: drutil's
-     * expansion is best-effort and may decline on BBs it can't safely rewrite
-     * (e.g. multi-instr BBs); silent fallback to no expansion is safer than
-     * a hard abort. */
-    if (getenv("VUZZER_EMPTY_APP2APP") == NULL)
-        (void)drutil_expand_rep_string(drcontext, bb);
-    return DR_EMIT_STORE_TRANSLATIONS;
-}
-
 static dr_emit_flags_t
 event_bb_insn(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
               bool for_trace, bool translating, void *user_data)
@@ -2189,16 +2173,19 @@ void
 libdft_core_init(void)
 {
     drutil_init();
-    /* TODO M1.4: enable drutil_expand_rep_string app2app pass so REP-prefixed
-     * MOVS/STOS/LODS expand and the per-iteration handlers below can fire.
-     * Currently disabled: registering the app2app pass triggers a libc-
-     * startup SIGSEGV similar to the D26 sub-register clean-call hazard,
-     * even with the expansion body no-op'd. Needs deeper DR debugging
-     * (priorities? BB-shape constraints? interaction with drreg slots?)
-     * before the recall gap for REP-string ops can be closed. The MOVS/
-     * STOS/LODS router cases below STILL fire on non-REP forms (rare but
-     * existent in libc bootstrap), so they earn their keep even without
-     * expansion. */
+    /* TODO M1.4 follow-up: enable drutil_expand_rep_string app2app pass.
+     * Investigation 2026-05-31 hit a libc-startup SIGSEGV that survives all
+     * the canonical fixes from DR's `memtrace_simple` sample (priority
+     * ordering, app2app filter via drutil_instr_is_stringop_loop,
+     * drmgr_orig_app_instr_for_operands for instr lookup, DR_EMIT_DEFAULT
+     * vs DR_EMIT_STORE_TRANSLATIONS). The crash fires on the FIRST expanded
+     * BB (ld-linux dynamic resolver) even with ALL of our per-instruction
+     * handlers fully disabled -- suggesting an interaction between
+     * drutil_expand_rep_string and one of our existing init paths
+     * (sdft_hook's drwrap, drreg's 4-slot config, or syscall hooks).
+     * Needs DR-list-quality investigation; defer to v0.2 of the libdft-dr
+     * release. The MOVS/STOS/LODS router cases STILL fire on non-REP
+     * forms, so the handlers earn their keep even without expansion. */
     drmgr_register_bb_instrumentation_event(NULL /*analysis*/, event_bb_insn,
                                             NULL);
 }
