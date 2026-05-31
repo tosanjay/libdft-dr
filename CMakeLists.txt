@@ -52,7 +52,8 @@ add_library(libdft-dr STATIC
     libdft_core_dr.cpp)
 target_include_directories(libdft-dr
     PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/third_party/EWAHBoolArray)
 # Pick up DR include paths + extension headers. configure_DynamoRIO_client on
 # a STATIC target sets only the include/compile flags we need (no link side).
 configure_DynamoRIO_client(libdft-dr)
