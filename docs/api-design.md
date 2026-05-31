@@ -307,6 +307,51 @@ void register_pc_range_sink(app_pc lo, app_pc hi, sink_cb cb);
 }  // namespace libdft_dr
 ```
 
+**(c) Function-entry callbacks** — fire on every call to a named (or
+PC-resolved) function, with taint-aware argument accessors. Solves the
+"is any argument of this function tainted?" pattern without hand-rolling
+drsym + drwrap on the client side. Internally backed by drsym (for name
+resolution) + drwrap (for the entry-point wrap); reuses the same
+infrastructure as the optional `sdft_hook` summaries.
+
+```cpp
+namespace libdft_dr {
+
+struct func_sink_context_t {
+    void *drcontext;
+    app_pc entry_pc;
+    /* Raw argument access (mirrors drwrap_get_arg semantics). */
+    uintptr_t arg(unsigned idx) const;
+    /* Tag of arg-as-scalar (the 8 bytes of the register/stack slot that
+     * holds the arg). Use for integer args, fd's, sizes, etc. */
+    tag_t arg_tag(unsigned idx) const;
+    /* Tag of *(arg+0 .. arg+n-1) — for pointer args. Returns empty tag
+     * if n == 0 or arg doesn't dereference. */
+    tag_t arg_pointed_tag(unsigned idx, size_t n) const;
+    /* Convenience: "is ANY of the first N pointed-to bytes tainted?". */
+    bool arg_pointed_is_tainted(unsigned idx, size_t n) const;
+    /* Convenience: full operand walker like the opcode-class sink form. */
+    template <typename F> void for_each_arg_tag(unsigned n_args, F &&f) const;
+};
+
+using func_sink_cb = std::function<void(const func_sink_context_t &)>;
+
+/* Resolve `func_name` in `module_basename` (e.g. "strlen" in "libc.so.6")
+ * and wrap its entry. module_basename == "" means "any loaded module".
+ * Returns false if the symbol can't be resolved (logged to stderr). */
+bool register_func_sink(const std::string &func_name,
+                        const std::string &module_basename,
+                        func_sink_cb cb);
+
+/* For clients that already know the PC (e.g. from a static analysis pass). */
+void register_func_sink_pc(app_pc entry_pc, func_sink_cb cb);
+
+}  // namespace libdft_dr
+```
+
+Use case (egress sanitizer 1B): `register_func_sink("write", "libc.so.6",
+[](const auto &ctx) { if (ctx.arg_pointed_is_tainted(1, ctx.arg(2))) alert(); });`
+
 **Threading note:** sink callbacks fire on the application's thread,
 inside the DR clean-call path. Heavy work (file I/O, mutex acquisition)
 is the client's responsibility to keep cheap; v0.1 single-thread
@@ -395,39 +440,53 @@ will need a reader-writer lock or a sharded variant.
 
 ---
 
-## 10. Open questions for sign-off
+## 10. Open questions — RESOLVED 2026-05-31
 
-**Q-API.1 — Reference-client count for v0.1.**
-Plan said 3-5. §6 currently lists 4. Are all four in scope, or trim to
-3 (drop 1D synthetic-unit, since it's really a unit-test harness)?
+**Q-API.1** ✅ Keep 4 reference clients (file_introspect, egress_sanitizer,
+vuzzer_cmp_sink, synthetic_unit).
 
-**Q-API.2 — `sink_context_t` operand walker.**
-The `for_each_operand_tag` template is more flexible than
-`operand_union()` but adds a header-only template surface (clients see
-implementation details). Keep both? Just one? Recommendation: keep both;
-80% of clients use `operand_union()`, the 20% with custom needs reach
-for the walker.
+**Q-API.2** ✅ Keep both `operand_union()` and `for_each_operand_tag`.
+**Plus extension:** add **function-entry sinks** (§5.2 (c)) as a first-class
+sink shape so clients can express "is any argument of function X tainted?"
+without hand-rolling drsym + drwrap. Use case 1B (egress sanitizer)
+benefits directly.
 
-**Q-API.3 — libdft64 compat shim scope.**
-§8 promises a best-effort header. Concrete bar: should the shim cover
-just the half-dozen functions vuzzer64-v2 uses, or the full libdft64
-public surface? Recommendation: just the functions actually used by
-the original libdft64 reference clients (looking at AngoraFuzzer's
-example, that's ~10 functions). Documented mapping table.
+**Q-API.3** ✅ Cover the ~10 functions VUzzer/Angora reference clients use,
+plus a small set of obviously-useful libdft64 standards. Concrete shim
+contents (subject to change as M3.2 surfaces real friction):
 
-**Q-API.4 — Namespace.**
-Currently `libdft_dr::` everywhere. Some clients may prefer `libdft::`
-(shorter) or no namespace at all (libdft64-style). Recommendation: keep
-`libdft_dr::`, ship the compat header for the no-namespace style.
+| libdft64 name | Maps to (libdft_dr::) | Notes |
+|---|---|---|
+| `tag_combine(tag_t&, tag_t&)` | `combine(tag_t, tag_t)` | Inline wrapper |
+| `tag_count(tag_t const&)` | `!tag.empty()` | Inline wrapper |
+| `tag_traits<tag_t>::cleared_val` | `tag_t{}` | Constant |
+| `tagmap_setb_with_tag(addr, tag)` | `set_mem_tag(addr, tag)` | Inline wrapper |
+| `file_tagmap_setb(addr, off)` | `set_mem_tag(addr, make_tag(off))` | Inline wrapper |
+| `file_tagmap_clrb(addr)` | `clear_mem(addr, 1)` | Inline wrapper |
+| `file_tagmap_clrn(addr, n)` | `clear_mem(addr, n)` | Inline wrapper |
+| `file_tagmap_getb(addr)` | `get_mem_tag(addr)` | Inline wrapper |
+| `file_tag_testb(addr)` | `!get_mem_tag(addr).empty()` | Inline wrapper |
+| `tag_sprint(tag_t const&)` | `to_string(tag_t)` | Inline wrapper |
+| `tag_dir_setb(dir, addr, tag)` | (internal — not shimmed) | tag_dir is an impl detail; shim consumers should never have used it |
+| `R32TAG(reg)` / `R64TAG(reg)` etc. | `get_reg_tag(reg_id)` | Macro → inline |
 
-**Q-API.5 — Build artifact.**
-Currently one `.so` (`libdft-dta-dr.so` = lib + the VUzzer client).
-For the standalone release this needs to split:
-- `libdft-dr.so` — the library itself
+12 entries. Goal: existing libdft64 clients compile by changing the
+include path (no rename, no symbol churn). The shim header lives at
+`<libdft_dr/libdft64_compat.h>` and is documented as "best-effort,
+covers the AngoraFuzzer/VUzzer reference set".
+
+**Q-API.4** ✅ `libdft_dr::` namespace. The compat shim header (Q-API.3)
+provides the libdft64 no-namespace style for legacy clients.
+
+**Q-API.5** ✅ Split build artifacts:
+- `libdft-dr.so` — the library itself (linked by client `.so`'s)
 - `clients/vuzzer_cmp_sink/libdft-dta-dr.so` — the reference client
+- `clients/file_introspect/libdft-introspect-dr.so` — reference client
+- `clients/egress_sanitizer/libdft-egress-dr.so` — reference client
+- `clients/synthetic_unit/` — built as a test executable, not a DR client
 
-Plus optional: a CMake config so clients can `find_package(libdft-dr)`.
-Recommendation: yes, split. ~30 min of CMake refactoring.
+CMake exports `libdft-dr::libdft-dr` so `find_package(libdft-dr)` works
+for external client projects.
 
 ---
 
@@ -442,16 +501,18 @@ Recommendation: yes, split. ~30 min of CMake refactoring.
 
 ---
 
-## 12. Sign-off checklist (M3.1 close)
+## 12. Sign-off checklist — APPROVED 2026-05-31
 
-Before M3.2 starts, the user explicitly approves:
-- [ ] Layer split (§2)
-- [ ] `tag_t` opaque-handle design (§4)
-- [ ] Two source patterns: built-in file + custom syscall (§5.1)
-- [ ] Two sink patterns: opcode-class + PC-range (§5.2)
-- [ ] Propagation overrides deferred to v0.2 (§5.4)
-- [ ] Four reference clients (§6)
-- [ ] No library-side output format (§7)
-- [ ] libdft64 compat shim included (§8)
-- [ ] Single-threaded for v0.1 (§9)
-- [ ] Answers to Q-API.1 through Q-API.5 (§10)
+User-approved before M3.2 implementation:
+- [x] Layer split (§2)
+- [x] `tag_t` opaque-handle design (§4)
+- [x] Two source patterns: built-in file + custom syscall (§5.1)
+- [x] **Three** sink patterns: opcode-class + PC-range + function-entry (§5.2)
+- [x] Propagation overrides deferred to v0.2 (§5.4)
+- [x] Four reference clients (§6)
+- [x] No library-side output format (§7)
+- [x] libdft64 compat shim included with 12-entry mapping table (§8, Q-API.3)
+- [x] Single-threaded for v0.1 (§9)
+- [x] Answers to Q-API.1 through Q-API.5 (§10)
+
+M3.2 (implementation) can start.
