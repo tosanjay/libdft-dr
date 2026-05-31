@@ -41,18 +41,31 @@ Output: `build/libdft-dta-dr.so` — load with `drrun -c build/libdft-dta-dr.so 
 
 ## Reference numbers
 
-Validated on `tiffcp` from libtiff with a 14 KB seed (`cmp.out` byte-equivalence
-against Pin libdft64 as the oracle):
+Mean ± stdev wallclock from 5 iterations per arm (single-machine, see
+`bench/BENCHMARKS.md` for methodology and reproduction instructions):
 
-| Property | Pin libdft64 (2018) | libdft-dr |
+| Target | Seed | native | libdft-dr | Pin libdft64 | dr / pin |
+|---|---|---|---|---|---|
+| tiffcp    | seeds_tiffcp/2.tif (12.7 KB)        | 0.012 ± 0.020 s | **1.25 ± 0.01 s**  | 3.48 ± 0.04 s  | **2.78× faster** |
+| xmllint   | seeds_xmllint/tutorA.rng (8.1 KB)   | 0.003 ± 0.000 s | **1.60 ± 0.01 s**  | 4.57 ± 0.05 s  | **2.85× faster** |
+| pdfimages | seeds/issue1985.pdf (9.9 KB)        | 0.009 ± 0.000 s | **8.25 ± 0.06 s**  | 10.12 ± 0.01 s | **1.23× faster** |
+
+Correctness (independent of perf bench; tiffcp seed-2 with Pin libdft64
+output as the oracle):
+
+| Property | Pin libdft64 (2018) | libdft-dr v0.1 |
 |---|---|---|
-| Speed (tiffcp seed-2, sdft off) | 4.02 s | **1.92 s** (~2.1× faster) |
 | False-positive offsets | n/a (oracle) | **0** (strict subset) |
-| Offset recall | 100% | 98.5% (v0.1; v0.2 targets ≥99.5%) |
+| Offset recall | 100 % | 98.5 % (gap = deferred REP-string-expansion opcodes; v0.2 closes this) |
 
-The speed delta has two compounding sources: DR's lower per-instruction
-instrumentation overhead vs Pin's `IARG_FAST_ANALYSIS_CALL`, and a small
-optimization in the per-byte tag map data structure (see `tagmap.cpp`).
+The pdfimages speedup is smaller than the parser targets because image-
+decode SUTs spend most of their cycles in float/SSE inner loops where
+neither engine instruments anything, muting the engine-cost delta.
+
+The speed advantage over Pin libdft64 has two compounding sources: DR's
+lower per-instruction instrumentation overhead vs Pin's
+`IARG_FAST_ANALYSIS_CALL`, and a small optimization in the per-byte tag
+map data structure (see `tagmap.cpp`).
 
 ## License
 
