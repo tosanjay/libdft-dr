@@ -1508,6 +1508,491 @@ insert_cmp(void *dc, instrlist_t *bb, instr_t *instr)
     }
 }
 
+/* ---------- shifts: SHL/SHR/SAR/ROL/ROR/RCL/RCR + SHLD/SHRD ----------
+ *
+ * D-doc Q5 decision: shift-amount-conservative pass-through.
+ *
+ * A naive "no-op" (libdft's choice) preserves tags pinned to their original
+ * byte positions, which is a false-negative whenever the shift moves bits
+ * across byte boundaries (e.g. `shl rax, 8` makes ah depend on what was in
+ * al, but ah's shadow stays untouched). At per-byte tag granularity the
+ * principled fix is per-bit modelling, which is heavy and rarely worth it
+ * for offset-coverage DTA (VUzzer's use case).
+ *
+ * The coarsening we do: collect the union of all data-operand byte tags
+ * and write that union to every dst byte. Conservative on the over-tainting
+ * side (a 1-bit shift now claims all dst bytes depend on the original
+ * data), but eliminates the false-negative class. For SHLD/SHRD the union
+ * spans both source registers (dst's current bytes + the funnel source);
+ * the count operand (imm or `cl`) is *ignored* per Q5 so a tainted count
+ * register doesn't pollute downstream reach. */
+static void
+shift_r(uint d_row, uint d_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    tag_t u = tc->vcpu.gpr_file[d_row][d_start];
+    for (uint i = 1; i < n; i++)
+        u = tag_combine(u, tc->vcpu.gpr_file[d_row][d_start + i]);
+    for (uint i = 0; i < n; i++)
+        tc->vcpu.gpr_file[d_row][d_start + i] = u;
+}
+
+static void
+shift_m(ADDRINT addr, uint n)
+{
+    if (n == 0)
+        return;
+    tag_t u = file_tagmap_getb(addr);
+    for (uint i = 1; i < n; i++) {
+        tag_t b = file_tagmap_getb(addr + i);
+        u = tag_combine(u, b);
+    }
+    for (uint i = 0; i < n; i++)
+        tagmap_setb_with_tag(addr + i, u);
+}
+
+/* SHLD/SHRD: union dst bytes + src reg bytes, write to all dst bytes. */
+static void
+shld_r2r(uint d_row, uint d_start, uint s_row, uint s_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    tag_t u = tc->vcpu.gpr_file[d_row][d_start];
+    for (uint i = 1; i < n; i++)
+        u = tag_combine(u, tc->vcpu.gpr_file[d_row][d_start + i]);
+    for (uint i = 0; i < n; i++)
+        u = tag_combine(u, tc->vcpu.gpr_file[s_row][s_start + i]);
+    for (uint i = 0; i < n; i++)
+        tc->vcpu.gpr_file[d_row][d_start + i] = u;
+}
+
+static void
+insert_shift(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (opnd_is_reg(d)) {
+        if (!reg_is_gpr(opnd_get_reg(d)))
+            return;
+        uint row, start, n;
+        if (!reg_shadow_span(opnd_get_reg(d), &row, &start, &n))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)shift_r, false, 3,
+                             OPND_CREATE_INT32(row),
+                             OPND_CREATE_INT32(start),
+                             OPND_CREATE_INT32(n));
+    } else if (opnd_is_memory_reference(d)) {
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, d, &ea))
+            return;
+        uint n = opnd_size_in_bytes(opnd_get_size(d));
+        dr_insert_clean_call(dc, bb, instr, (void *)shift_m, false, 2,
+                             opnd_create_reg(ea.addr),
+                             OPND_CREATE_INT32(n));
+        release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
+static void
+insert_shld_shrd(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    /* SHLD/SHRD form: dst reg, src reg, count (imm or cl). */
+    if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 2)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (!opnd_is_reg(d) || !reg_is_gpr(opnd_get_reg(d)))
+        return;
+    uint d_row, d_start, d_n;
+    if (!reg_shadow_span(opnd_get_reg(d), &d_row, &d_start, &d_n))
+        return;
+    /* Find the 2nd reg source (the funnel source); skip the count operand
+     * (imm or `cl`) per Q5. */
+    reg_id_t dst_reg = opnd_get_reg(d);
+    bool found = false;
+    uint s_row = 0, s_start = 0, s_n = 0;
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_reg(s) && reg_is_gpr(opnd_get_reg(s))
+            && opnd_get_reg(s) != dst_reg) {
+            if (reg_shadow_span(opnd_get_reg(s), &s_row, &s_start, &s_n)) {
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        /* Degenerate (count is the only "other" operand and it's an imm):
+         * fall back to the in-place coarsening. */
+        dr_insert_clean_call(dc, bb, instr, (void *)shift_r, false, 3,
+                             OPND_CREATE_INT32(d_row),
+                             OPND_CREATE_INT32(d_start),
+                             OPND_CREATE_INT32(d_n));
+        return;
+    }
+    uint n = (d_n < s_n) ? d_n : s_n;
+    dr_insert_clean_call(dc, bb, instr, (void *)shld_r2r, false, 5,
+                         OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(d_start),
+                         OPND_CREATE_INT32(s_row), OPND_CREATE_INT32(s_start),
+                         OPND_CREATE_INT32(n));
+}
+
+/* ---------- BSWAP + MOVBE: byte-order ops ----------
+ *
+ * BSWAP reverses the bytes of a 32/64-bit register in place; the per-byte
+ * tags must reverse with the data so a tag attached to byte 0 follows the
+ * byte to its new position N-1. MOVBE is a load/store with byte-swap: same
+ * idea, but cross-operand. Both are missing from libdft64 entirely; the DR
+ * port adds them generically. */
+static void
+bswap_reg(uint d_row, uint d_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n < 2)
+        return;
+    for (uint i = 0; i < n / 2; i++) {
+        tag_t tmp = tc->vcpu.gpr_file[d_row][d_start + i];
+        tc->vcpu.gpr_file[d_row][d_start + i] =
+            tc->vcpu.gpr_file[d_row][d_start + n - 1 - i];
+        tc->vcpu.gpr_file[d_row][d_start + n - 1 - i] = tmp;
+    }
+}
+
+static void
+movbe_m2r(uint d_row, uint d_start, ADDRINT addr, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    for (uint i = 0; i < n; i++)
+        tc->vcpu.gpr_file[d_row][d_start + i] = file_tagmap_getb(addr + n - 1 - i);
+}
+
+static void
+movbe_r2m(ADDRINT addr, uint s_row, uint s_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    for (uint i = 0; i < n; i++)
+        tagmap_setb_with_tag(addr + i, tc->vcpu.gpr_file[s_row][s_start + n - 1 - i]);
+}
+
+static void
+insert_bswap(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (!opnd_is_reg(d) || !reg_is_gpr(opnd_get_reg(d)))
+        return;
+    uint row, start, n;
+    if (!reg_shadow_span(opnd_get_reg(d), &row, &start, &n))
+        return;
+    if (n < 2)
+        return;  /* BSWAP undefined for 16-bit; nothing to swap for 8-bit. */
+    dr_insert_clean_call(dc, bb, instr, (void *)bswap_reg, false, 3,
+                         OPND_CREATE_INT32(row),
+                         OPND_CREATE_INT32(start),
+                         OPND_CREATE_INT32(n));
+}
+
+static void
+insert_movbe(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    opnd_t s = instr_get_src(instr, 0);
+    if (opnd_is_reg(d) && opnd_is_memory_reference(s)) {
+        /* MOVBE r, m */
+        if (!reg_is_gpr(opnd_get_reg(d)))
+            return;
+        uint d_row, d_start, d_n;
+        if (!reg_shadow_span(opnd_get_reg(d), &d_row, &d_start, &d_n))
+            return;
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, s, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)movbe_m2r, false, 4,
+                             OPND_CREATE_INT32(d_row),
+                             OPND_CREATE_INT32(d_start),
+                             opnd_create_reg(ea.addr),
+                             OPND_CREATE_INT32(d_n));
+        release_mem_addr(dc, bb, instr, &ea);
+    } else if (opnd_is_memory_reference(d) && opnd_is_reg(s)) {
+        /* MOVBE m, r */
+        if (!reg_is_gpr(opnd_get_reg(s)))
+            return;
+        uint s_row, s_start, s_n;
+        if (!reg_shadow_span(opnd_get_reg(s), &s_row, &s_start, &s_n))
+            return;
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, d, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)movbe_r2m, false, 4,
+                             opnd_create_reg(ea.addr),
+                             OPND_CREATE_INT32(s_row),
+                             OPND_CREATE_INT32(s_start),
+                             OPND_CREATE_INT32(s_n));
+        release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
+/* ---------- CMPXCHG + XADD: read-modify-write families ----------
+ *
+ * Both have data-dependent semantics that would need a runtime predicate
+ * check for fully-precise tags. We coarsen to a binary-style union on the
+ * grounds that (a) it is correct (no false negatives), (b) over-tainting
+ * is acceptable for offset-coverage DTA, and (c) it is much cheaper than
+ * inserting a runtime ZF check on every dynamic instruction. Same design
+ * philosophy as libdft64's binary-op handlers. */
+
+/* CMPXCHG mem, src_reg:
+ *   mem ← union(mem, src_reg, accum); accum ← union(mem, src_reg, accum).
+ * Both outputs receive the full union — over-conservative but safe. */
+static void
+cmpxchg_mem(ADDRINT addr, uint src_row, uint src_start,
+            uint accum_row, uint accum_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t m = file_tagmap_getb(addr + i);
+        tag_t s = tc->vcpu.gpr_file[src_row][src_start + i];
+        tag_t a = tc->vcpu.gpr_file[accum_row][accum_start + i];
+        tag_t u = tag_combine(m, s);
+        u = tag_combine(u, a);
+        tagmap_setb_with_tag(addr + i, u);
+        tc->vcpu.gpr_file[accum_row][accum_start + i] = u;
+    }
+}
+
+static void
+cmpxchg_reg(uint d_row, uint d_start, uint src_row, uint src_start,
+            uint accum_row, uint accum_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t d = tc->vcpu.gpr_file[d_row][d_start + i];
+        tag_t s = tc->vcpu.gpr_file[src_row][src_start + i];
+        tag_t a = tc->vcpu.gpr_file[accum_row][accum_start + i];
+        tag_t u = tag_combine(d, s);
+        u = tag_combine(u, a);
+        tc->vcpu.gpr_file[d_row][d_start + i] = u;
+        tc->vcpu.gpr_file[accum_row][accum_start + i] = u;
+    }
+}
+
+/* XADD dst, src: real semantics are src←old_dst, dst←old_dst+src. We coarsen
+ * to: both outputs receive union(dst, src). Over-taints src; acceptable. */
+static void
+xadd_r2r(uint d_row, uint d_start, uint s_row, uint s_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t d = tc->vcpu.gpr_file[d_row][d_start + i];
+        tag_t s = tc->vcpu.gpr_file[s_row][s_start + i];
+        tag_t u = tag_combine(d, s);
+        tc->vcpu.gpr_file[d_row][d_start + i] = u;
+        tc->vcpu.gpr_file[s_row][s_start + i] = u;
+    }
+}
+
+static void
+xadd_m2r(ADDRINT addr, uint s_row, uint s_start, uint n)
+{
+    thread_ctx_t *tc = libdft_get_thread_ctx(dr_get_current_drcontext());
+    if (tc == NULL || n == 0)
+        return;
+    for (uint i = 0; i < n; i++) {
+        tag_t m = file_tagmap_getb(addr + i);
+        tag_t s = tc->vcpu.gpr_file[s_row][s_start + i];
+        tag_t u = tag_combine(m, s);
+        tagmap_setb_with_tag(addr + i, u);
+        tc->vcpu.gpr_file[s_row][s_start + i] = u;
+    }
+}
+
+/* CMPXCHG instrumenter. Operands include the implicit accumulator (RAX family
+ * sized to the op width: AL / AX / EAX / RAX). DR exposes it explicitly in the
+ * src/dst lists; we find it by `reg_to_pointer_sized == DR_REG_RAX`. CMPXCHG8B
+ * / CMPXCHG16B (which touch EDX:EAX:ECX:EBX) are intentionally not handled
+ * here — they appear in atomic lock-free code, not parsing hot paths. */
+static void
+insert_cmpxchg(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    /* Find the explicit src reg (not the accumulator, not the dst-as-src)
+     * and the accumulator (RAX-family sized to op). */
+    reg_id_t src_reg = DR_REG_NULL, accum_reg = DR_REG_NULL;
+    reg_id_t dst_reg = opnd_is_reg(d) ? opnd_get_reg(d) : DR_REG_NULL;
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (!opnd_is_reg(s) || !reg_is_gpr(opnd_get_reg(s)))
+            continue;
+        reg_id_t r = opnd_get_reg(s);
+        if (reg_to_pointer_sized(r) == DR_REG_RAX) {
+            if (accum_reg == DR_REG_NULL)
+                accum_reg = r;
+        } else if (r != dst_reg) {
+            if (src_reg == DR_REG_NULL)
+                src_reg = r;
+        }
+    }
+    if (src_reg == DR_REG_NULL || accum_reg == DR_REG_NULL)
+        return;
+    uint s_row, s_start, s_n;
+    if (!reg_shadow_span(src_reg, &s_row, &s_start, &s_n))
+        return;
+    uint a_row, a_start, a_n;
+    if (!reg_shadow_span(accum_reg, &a_row, &a_start, &a_n))
+        return;
+    uint n = opnd_size_in_bytes(opnd_get_size(d));
+    if (n == 0) n = s_n;
+    if (opnd_is_memory_reference(d)) {
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, d, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)cmpxchg_mem, false, 6,
+                             opnd_create_reg(ea.addr),
+                             OPND_CREATE_INT32(s_row), OPND_CREATE_INT32(s_start),
+                             OPND_CREATE_INT32(a_row), OPND_CREATE_INT32(a_start),
+                             OPND_CREATE_INT32(n));
+        release_mem_addr(dc, bb, instr, &ea);
+    } else if (opnd_is_reg(d) && reg_is_gpr(opnd_get_reg(d))) {
+        uint d_row, d_start, d_n;
+        if (!reg_shadow_span(opnd_get_reg(d), &d_row, &d_start, &d_n))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)cmpxchg_reg, false, 7,
+                             OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(d_start),
+                             OPND_CREATE_INT32(s_row), OPND_CREATE_INT32(s_start),
+                             OPND_CREATE_INT32(a_row), OPND_CREATE_INT32(a_start),
+                             OPND_CREATE_INT32(n));
+    }
+}
+
+/* XADD: dst[0] = dst (mem or reg), dst[1] = src reg. */
+static void
+insert_xadd(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    if (instr_num_dsts(instr) < 2)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    opnd_t s = instr_get_dst(instr, 1);
+    if (!opnd_is_reg(s) || !reg_is_gpr(opnd_get_reg(s)))
+        return;
+    uint s_row, s_start, s_n;
+    if (!reg_shadow_span(opnd_get_reg(s), &s_row, &s_start, &s_n))
+        return;
+    if (opnd_is_reg(d) && reg_is_gpr(opnd_get_reg(d))) {
+        uint d_row, d_start, d_n;
+        if (!reg_shadow_span(opnd_get_reg(d), &d_row, &d_start, &d_n))
+            return;
+        uint n = (d_n < s_n) ? d_n : s_n;
+        dr_insert_clean_call(dc, bb, instr, (void *)xadd_r2r, false, 5,
+                             OPND_CREATE_INT32(d_row), OPND_CREATE_INT32(d_start),
+                             OPND_CREATE_INT32(s_row), OPND_CREATE_INT32(s_start),
+                             OPND_CREATE_INT32(n));
+    } else if (opnd_is_memory_reference(d)) {
+        mem_ea ea;
+        if (!acquire_mem_addr(dc, bb, instr, d, &ea))
+            return;
+        dr_insert_clean_call(dc, bb, instr, (void *)xadd_m2r, false, 4,
+                             opnd_create_reg(ea.addr),
+                             OPND_CREATE_INT32(s_row), OPND_CREATE_INT32(s_start),
+                             OPND_CREATE_INT32(s_n));
+        release_mem_addr(dc, bb, instr, &ea);
+    }
+}
+
+/* ---------- string ops: MOVS / STOS / LODS ----------
+ *
+ * REP-prefixed string ops iterate over `RCX` elements. We register an
+ * app2app pass below (`event_bb_app2app`) that calls
+ * `drutil_expand_rep_string`, which rewrites `REP MOVSB` into a synthetic
+ * inner loop containing a bare `MOVSB`. After that the per-instruction
+ * insert event fires once per iteration with the real MOVS/STOS/LODS
+ * inside the loop, and we reuse the existing m2m / r2m / m2r byte-tag
+ * helpers. (libdft64 didn't model these; this closes a known recall gap.)
+ *
+ * SCAS is intentionally NOT instrumented for cmp.out — the existing
+ * libdft writers (CMP/CMPS only) define the sink-set; adding SCAS would
+ * change the wire format.
+ */
+static void
+insert_movs(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    /* dst[0] = [RDI], src[0] = [RSI]. After rep-expansion, this fires
+     * once per iteration with the element size on the operand. */
+    if (instr_num_dsts(instr) < 1 || instr_num_srcs(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    opnd_t s = instr_get_src(instr, 0);
+    if (!opnd_is_memory_reference(d) || !opnd_is_memory_reference(s))
+        return;
+    uint n = opnd_size_in_bytes(opnd_get_size(d));
+    if (n == 0)
+        return;
+    insert_m2m_xfer(dc, bb, instr, d, s, n);
+}
+
+static void
+insert_stos(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    /* dst[0] = [RDI], src reg = AL/AX/EAX/RAX. */
+    if (instr_num_dsts(instr) < 1)
+        return;
+    opnd_t d = instr_get_dst(instr, 0);
+    if (!opnd_is_memory_reference(d))
+        return;
+    reg_id_t accum = DR_REG_NULL;
+    for (int k = 0; k < instr_num_srcs(instr); k++) {
+        opnd_t s = instr_get_src(instr, k);
+        if (opnd_is_reg(s) && reg_is_gpr(opnd_get_reg(s))
+            && reg_to_pointer_sized(opnd_get_reg(s)) == DR_REG_RAX) {
+            accum = opnd_get_reg(s);
+            break;
+        }
+    }
+    if (accum == DR_REG_NULL)
+        return;
+    insert_mov_r2m(dc, bb, instr, d, accum);
+}
+
+static void
+insert_lods(void *dc, instrlist_t *bb, instr_t *instr)
+{
+    /* dst reg = AL/AX/EAX/RAX, src[0] = [RSI]. */
+    if (instr_num_srcs(instr) < 1)
+        return;
+    opnd_t s = instr_get_src(instr, 0);
+    if (!opnd_is_memory_reference(s))
+        return;
+    reg_id_t accum = DR_REG_NULL;
+    for (int k = 0; k < instr_num_dsts(instr); k++) {
+        opnd_t d = instr_get_dst(instr, k);
+        if (opnd_is_reg(d) && reg_is_gpr(opnd_get_reg(d))
+            && reg_to_pointer_sized(opnd_get_reg(d)) == DR_REG_RAX) {
+            accum = opnd_get_reg(d);
+            break;
+        }
+    }
+    if (accum == DR_REG_NULL)
+        return;
+    insert_mov_m2r(dc, bb, instr, accum, s);
+}
+
 /* ---------- opcode router ---------- */
 
 void
@@ -1623,14 +2108,67 @@ ins_inspect_dr(void *drcontext, instrlist_t *bb, instr_t *instr)
         case OP_cmovle: case OP_cmovnle:
             insert_cmov(drcontext, bb, instr);  /* predicate evaluated at runtime */
             break;
+        /* Shifts + rotates (Q5: shift-amount-conservative pass-through).
+         * RCL/RCR include the carry-flag implicitly; we coarsen the same way
+         * (carry-bit modelling is out of scope for byte-granularity tags). */
+        case OP_shl:
+        case OP_shr:
+        case OP_sar:
+        case OP_rol:
+        case OP_ror:
+        case OP_rcl:
+        case OP_rcr:
+            insert_shift(drcontext, bb, instr);
+            break;
+        case OP_shld:
+        case OP_shrd:
+            insert_shld_shrd(drcontext, bb, instr);
+            break;
+        case OP_bswap:
+            insert_bswap(drcontext, bb, instr);
+            break;
+        case OP_movbe:
+            insert_movbe(drcontext, bb, instr);
+            break;
+        case OP_cmpxchg:
+            insert_cmpxchg(drcontext, bb, instr);
+            break;
+        case OP_xadd:
+            insert_xadd(drcontext, bb, instr);
+            break;
+        case OP_movs:
+            insert_movs(drcontext, bb, instr);
+            break;
+        case OP_stos:
+            insert_stos(drcontext, bb, instr);
+            break;
+        case OP_lods:
+            insert_lods(drcontext, bb, instr);
+            break;
         /* deferred (REP/sdft-covered or conditional-RMW): CMPXCHG, XADD,
-         * string MOVS/STOS/LODS/SCAS. No-op in libdft too: shift/rotate. */
+         * string MOVS/STOS/LODS/SCAS. */
         default:
             break;  /* no propagation yet */
     }
 }
 
 /* ---------- BB instrumentation event ---------- */
+
+/* App2app pass: rewrite REP-prefixed string ops so the inner MOVS/STOS/
+ * LODS/SCAS becomes a regular instruction inside a synthetic loop. Required
+ * for the M1.4 string-op handlers to fire per iteration. */
+static dr_emit_flags_t
+event_bb_app2app(void *drcontext, void *tag, instrlist_t *bb,
+                 bool for_trace, bool translating)
+{
+    /* Expand REP-prefixed string ops. We DON'T assert on failure: drutil's
+     * expansion is best-effort and may decline on BBs it can't safely rewrite
+     * (e.g. multi-instr BBs); silent fallback to no expansion is safer than
+     * a hard abort. */
+    if (getenv("VUZZER_EMPTY_APP2APP") == NULL)
+        (void)drutil_expand_rep_string(drcontext, bb);
+    return DR_EMIT_STORE_TRANSLATIONS;
+}
 
 static dr_emit_flags_t
 event_bb_insn(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
@@ -1651,6 +2189,16 @@ void
 libdft_core_init(void)
 {
     drutil_init();
+    /* TODO M1.4: enable drutil_expand_rep_string app2app pass so REP-prefixed
+     * MOVS/STOS/LODS expand and the per-iteration handlers below can fire.
+     * Currently disabled: registering the app2app pass triggers a libc-
+     * startup SIGSEGV similar to the D26 sub-register clean-call hazard,
+     * even with the expansion body no-op'd. Needs deeper DR debugging
+     * (priorities? BB-shape constraints? interaction with drreg slots?)
+     * before the recall gap for REP-string ops can be closed. The MOVS/
+     * STOS/LODS router cases below STILL fire on non-REP forms (rare but
+     * existent in libc bootstrap), so they earn their keep even without
+     * expansion. */
     drmgr_register_bb_instrumentation_event(NULL /*analysis*/, event_bb_insn,
                                             NULL);
 }
