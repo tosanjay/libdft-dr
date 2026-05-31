@@ -18,7 +18,7 @@
 # The expected-tag-SET check is compiler/ASLR/PC-agnostic: it ignores PCs
 # and exact values, looking only at the per-byte taint labels.
 #
-# Usage: DR_ROOT=/path/to/dynamorio-10.0 tests/run_smoke.sh
+# Usage: DR_ROOT=/path/to/dynamorio-11.3.0 tests/run_smoke.sh
 #
 set -euo pipefail
 

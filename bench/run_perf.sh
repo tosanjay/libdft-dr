@@ -29,7 +29,7 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # --- knobs (env-overridable) ----------------------------------------------
 BENCH_ITERS="${BENCH_ITERS:-5}"
 BENCH_OUT="${BENCH_OUT:-$REPO/bench/results.md}"
-DR_ROOT="${DR_ROOT:-/home/sanjay/san-home/tools/dynamorio-10.0}"
+DR_ROOT="${DR_ROOT:-/home/sanjay/san-home/tools/dynamorio-11.3.0}"
 PIN_ROOT="${PIN_ROOT:-/home/sanjay/san-home/tools/pin-3.20}"
 LIBDFT_DR_SO="${LIBDFT_DR_SO:-$REPO/build/clients/vuzzer_cmp_sink/libdft-dta-dr-v2.so}"
 LIBDFT_PIN_SO="${LIBDFT_PIN_SO:-$REPO/../vuzzer64-v2/libdft64/tools/libdft-dta.so}"

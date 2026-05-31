@@ -9,13 +9,13 @@ PRs.
 ## Quick build
 
 Prereqs: Ubuntu 22.04 or 24.04, GCC ≥ 11, CMake ≥ 3.10, and a
-DynamoRIO 10.0 install with development headers.
+DynamoRIO 11.3 install with development headers.
 
 ```sh
-# Install DynamoRIO 10.0 (one-time):
-curl -fLO https://github.com/DynamoRIO/dynamorio/releases/download/release_10.0.0/DynamoRIO-Linux-10.0.0.tar.gz
-tar xzf DynamoRIO-Linux-10.0.0.tar.gz
-export DR_ROOT=$PWD/DynamoRIO-Linux-10.0.0
+# Install DynamoRIO 11.3.0 (one-time):
+curl -fLO https://github.com/DynamoRIO/dynamorio/releases/download/release_11.3.0-1/DynamoRIO-Linux-11.3.0.tar.gz
+tar xzf DynamoRIO-Linux-11.3.0.tar.gz
+export DR_ROOT=$PWD/DynamoRIO-Linux-11.3.0-1
 
 # Build libdft-dr + all 4 reference clients:
 git clone https://github.com/tosanjay/libdft-dr
@@ -40,7 +40,7 @@ The CI workflow that runs on every PR is in
 `.github/workflows/ci.yml`. To replicate it locally:
 
 ```sh
-DR_ROOT=/path/to/DynamoRIO-Linux-10.0.0 ./tests/run_smoke.sh
+DR_ROOT=/path/to/DynamoRIO-Linux-11.3.0 ./tests/run_smoke.sh
 ```
 
 This runs two checks:
@@ -61,7 +61,7 @@ Local only — Pin requires an EULA-gated download, so the bench isn't
 in CI.
 
 ```sh
-export DR_ROOT=/path/to/DynamoRIO-Linux-10.0.0
+export DR_ROOT=/path/to/DynamoRIO-Linux-11.3.0
 export PIN_ROOT=/path/to/pin-3.20                                # optional
 export LIBDFT_PIN_SO=/path/to/libdft64/tools/libdft-dta.so       # optional
 ./bench/run_perf.sh

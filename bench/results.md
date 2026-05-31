@@ -1,9 +1,9 @@
 # libdft-dr v0.1 perf benchmarks
 
-Generated: 2026-05-31 12:44:07 UTC
+Generated: 2026-05-31 15:47:05 UTC
 Host: Linux 6.8.0-107-generic x86_64, 8 cores
 CPU: Intel(R) Core(TM) i7-8650U CPU @ 1.90GHz
-DR: drrun version 10.0.0 -- build 0
+DR: drrun version 11.3.0 -- build 1
 Pin: tools/pin-3.20
 Iterations per (target, arm): 5 (+1 warmup discarded)
 
@@ -16,11 +16,11 @@ Methodology and caveats: see bench/BENCHMARKS.md.
 
 | arm | mean (s) | stdev (s) | × native |
 |---|---|---|---|
-| native       | 0.0116 | 0.0201 | 1.0× |
-| dr           | 1.2516 | 0.0123 | 107.9× |
-| pin          | 3.4801 | 0.0404 | 300.0× |
+| native       | 0.0027 | 0.0002 | 1.0× |
+| dr           | 0.7498 | 0.0103 | 277.7× |
+| pin          | 3.4033 | 0.0164 | 1260.5× |
 
-**libdft-dr speedup over Pin libdft64:** 2.78×
+**libdft-dr speedup over Pin libdft64:** 4.54×
 
 ## xmllint
 
@@ -29,11 +29,11 @@ Methodology and caveats: see bench/BENCHMARKS.md.
 
 | arm | mean (s) | stdev (s) | × native |
 |---|---|---|---|
-| native       | 0.0027 | 0.0001 | 1.0× |
-| dr           | 1.6038 | 0.0100 | 594.0× |
-| pin          | 4.5650 | 0.0522 | 1690.7× |
+| native       | 0.0028 | 0.0001 | 1.0× |
+| dr           | 1.0833 | 0.0142 | 386.9× |
+| pin          | 4.5545 | 0.0206 | 1626.6× |
 
-**libdft-dr speedup over Pin libdft64:** 2.85×
+**libdft-dr speedup over Pin libdft64:** 4.20×
 
 ## pdfimages
 
@@ -42,9 +42,9 @@ Methodology and caveats: see bench/BENCHMARKS.md.
 
 | arm | mean (s) | stdev (s) | × native |
 |---|---|---|---|
-| native       | 0.0085 | 0.0002 | 1.0× |
-| dr           | 8.2464 | 0.0635 | 970.2× |
-| pin          | 10.1177 | 0.0053 | 1190.3× |
+| native       | 0.0086 | 0.0002 | 1.0× |
+| dr           | 4.6007 | 0.0714 | 535.0× |
+| pin          | 10.1097 | 0.0021 | 1175.5× |
 
-**libdft-dr speedup over Pin libdft64:** 1.23×
+**libdft-dr speedup over Pin libdft64:** 2.20×
 

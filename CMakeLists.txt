@@ -4,7 +4,8 @@
 #   cd libdft-dr
 #   cmake -B build -DDynamoRIO_DIR=$DR_ROOT/cmake
 #   cmake --build build -j
-# where DR_ROOT=/home/sanjay/san-home/tools/dynamorio-10.0
+# where DR_ROOT=/path/to/dynamorio-11.3.0  (DR 11.3 is the supported baseline;
+# DR 10.x worked through M5 but SIGFPEs on glibc 2.39 / Ubuntu 24.04).
 #
 # Layout (M3.2):
 #   src/, include/libdft_dr/   -- the library + public headers

@@ -6,7 +6,7 @@ data-flow model — per-byte shadow memory, per-instruction propagation,
 syscall-based source painting, CMP/LEA sinks — on top of DynamoRIO instead
 of Intel Pin.
 
-**~2-3× faster than Pin libdft64** on parser benchmarks (tiffcp, xmllint);
+**~4× faster than Pin libdft64** on parser benchmarks (tiffcp, xmllint);
 byte-equivalent `cmp.out` / `lea.out` output for VUzzer64-style fuzzers.
 
 **Status:** v0.1 in private development; not yet released.
@@ -22,7 +22,7 @@ byte-equivalent `cmp.out` / `lea.out` output for VUzzer64-style fuzzers.
 | Release cadence | ~yearly (Pin) | multi-release-per-year (DR) |
 | Tag representation | per-byte EWAH bitmap | per-byte interned-set 32-bit ID |
 | Build system | Pin's GNU make | CMake (DR-native) |
-| Speed vs Pin libdft64 (tiffcp seed-2) | 1.0× (oracle) | **~2.78×** |
+| Speed vs Pin libdft64 (tiffcp seed-2) | 1.0× (oracle) | **~4.54×** |
 | Recall vs Pin oracle (tiffcp seed-2) | 100 % | 98.5 % (v0.1) |
 | False-positive offsets | n/a (oracle) | **0** (strict subset) |
 | Generic taint policies | byte-set (fixed) | byte-set (fixed); user-defined sinks |
@@ -35,10 +35,10 @@ without abandoning the libdft data-flow model.
 
 ## Quick start
 
-Requires DynamoRIO ≥ 10.0 with development headers and CMake ≥ 3.10.
+Requires DynamoRIO ≥ 11.3 with development headers and CMake ≥ 3.10.
 
 ```sh
-export DR_ROOT=/path/to/dynamorio-10.0
+export DR_ROOT=/path/to/dynamorio-11.3.0
 cmake -B build -DDynamoRIO_DIR="$DR_ROOT/cmake"
 cmake --build build -j
 
@@ -121,9 +121,9 @@ sha256 manifest in [bench/BENCHMARKS.md](bench/BENCHMARKS.md):
 
 | Target | Seed | native | libdft-dr | Pin libdft64 | dr / pin |
 |---|---|---|---|---|---|
-| tiffcp    | seeds_tiffcp/2.tif (12.7 KB)        | 0.012 ± 0.020 s | **1.25 ± 0.01 s**  | 3.48 ± 0.04 s  | **2.78× faster** |
-| xmllint   | seeds_xmllint/tutorA.rng (8.1 KB)   | 0.003 ± 0.000 s | **1.60 ± 0.01 s**  | 4.57 ± 0.05 s  | **2.85× faster** |
-| pdfimages | seeds/issue1985.pdf (9.9 KB)        | 0.009 ± 0.000 s | **8.25 ± 0.06 s**  | 10.12 ± 0.01 s | **1.23× faster** |
+| tiffcp    | seeds_tiffcp/2.tif (12.7 KB)        | 0.003 ± 0.000 s | **0.75 ± 0.01 s**  | 3.40 ± 0.02 s  | **4.54× faster** |
+| xmllint   | seeds_xmllint/tutorA.rng (8.1 KB)   | 0.003 ± 0.000 s | **1.08 ± 0.01 s**  | 4.55 ± 0.02 s  | **4.20× faster** |
+| pdfimages | seeds/issue1985.pdf (9.9 KB)        | 0.009 ± 0.000 s | **4.60 ± 0.07 s**  | 10.11 ± 0.00 s | **2.20× faster** |
 
 The pdfimages speedup is smaller than the parser targets because image-
 decode SUTs spend most cycles in float/SSE inner loops where neither

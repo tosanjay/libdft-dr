@@ -11,19 +11,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Ubuntu 22.04 has the libstdc++ that EWAH's template tags compile
-        # against cleanly; 24.04 verifies forward-compat.
+        # 22.04 = glibc 2.35; 24.04 = glibc 2.39. DR 10.0 SIGFPEs at startup
+        # under glibc 2.39; DR 11.x is the fix. We pin DR 11.3.0 (Jan 2025
+        # stable, current latest tagged release).
         os: [ubuntu-22.04, ubuntu-24.04]
     runs-on: ${{ matrix.os }}
 
     env:
-      DR_VERSION: "10.0.0"
-      DR_TARBALL: "DynamoRIO-Linux-10.0.0.tar.gz"
-      DR_URL: "https://github.com/DynamoRIO/dynamorio/releases/download/release_10.0.0/DynamoRIO-Linux-10.0.0.tar.gz"
+      DR_VERSION: "11.3.0"
+      DR_RELEASE_TAG: "release_11.3.0-1"
+      DR_TARBALL: "DynamoRIO-Linux-11.3.0.tar.gz"
+      DR_URL: "https://github.com/DynamoRIO/dynamorio/releases/download/release_11.3.0-1/DynamoRIO-Linux-11.3.0.tar.gz"
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build deps
         run: |
@@ -32,7 +34,7 @@ jobs:
 
       - name: Cache DynamoRIO
         id: cache-dr
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/dynamorio-${{ env.DR_VERSION }}
           key: dynamorio-${{ env.DR_VERSION }}-${{ matrix.os }}
@@ -43,7 +45,10 @@ jobs:
           cd ~
           curl -fLO "${{ env.DR_URL }}"
           tar xzf "${{ env.DR_TARBALL }}"
-          mv "DynamoRIO-Linux-${{ env.DR_VERSION }}" "dynamorio-${{ env.DR_VERSION }}"
+          # Tarball extracts to "DynamoRIO-Linux-<version>" or
+          # "DynamoRIO-Linux-<version>-<build>" depending on the release;
+          # match the actual extracted dir via shell glob.
+          mv DynamoRIO-Linux-${{ env.DR_VERSION }}* "dynamorio-${{ env.DR_VERSION }}"
 
       - name: Verify DR
         run: |
@@ -67,5 +72,5 @@ jobs:
 
       - name: Smoke test (synthetic_unit + vuzzer_cmp_sink tag-set check)
         env:
-          DR_ROOT: /home/runner/dynamorio-10.0.0
+          DR_ROOT: /home/runner/dynamorio-11.3.0
         run: ./tests/run_smoke.sh

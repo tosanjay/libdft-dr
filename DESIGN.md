@@ -20,7 +20,7 @@ DynamoRIO has materially lower per-instruction instrumentation
 overhead than Pin and is BSD-licensed and open-source on a
 multi-release-per-year cadence. Porting the libdft data-flow model
 across DBI frameworks is the lever that actually moves the needle:
-this work delivers **~2-3× speedup over Pin libdft64** on parser
+this work delivers **~4× speedup over Pin libdft64** on parser
 benchmarks (see §7) while preserving the data-flow semantics existing
 clients depend on.
 
@@ -203,12 +203,16 @@ the rare cmp.out / lea.out sink emissions.
 
 > *This optimization was developed jointly with Cristiano Giuffrida.*
 
-**Result.** The tiffcp seed-2 wallclock dropped 9.32 s → 1.92 s (sdft
-off), making DR ~2.1× faster than Pin libdft64 (4.02 s) and meeting
-the project's ≤ 2.0 s wallclock target. Offset oracle preserved
-exactly (1082 / 1098, 0 false). Residual EWAH cost is ~2-5 %, in the
-intern dedup-key build; a v0.2 optimization keys `g_intern` on a hash
-of the EWAH buffer instead of its serialized string.
+**Result.** On the original DR 10.0 build the tiffcp seed-2 wallclock
+dropped 9.32 s → 1.92 s (sdft off) from this change alone, making DR
+~2.1× faster than Pin libdft64 (4.02 s) and meeting the project's
+≤ 2.0 s wallclock target. The current published numbers (§7) compose
+that improvement with the move to DR 11.3, which delivered a further
+~1.7× on the same workload — net 4.54× speedup over Pin. Offset
+oracle preserved exactly (1082 / 1098, 0 false) across both
+transitions. Residual EWAH cost is ~2-5 %, in the intern dedup-key
+build; a v0.2 optimization keys `g_intern` on a hash of the EWAH
+buffer instead of its serialized string.
 
 The public tag-map API (`tag_combine`, `tag_dir_setb`, etc.) is
 unchanged from the EWAH version — the representation swap is internal,
@@ -222,9 +226,9 @@ reproduction instructions in
 
 | Target | Seed | libdft-dr | Pin libdft64 | speedup |
 |---|---|---|---|---|
-| tiffcp    | 12.7 KB TIFF  | **1.25 ± 0.01 s** | 3.48 ± 0.04 s  | **2.78×** |
-| xmllint   | 8.1 KB XML    | **1.60 ± 0.01 s** | 4.57 ± 0.05 s  | **2.85×** |
-| pdfimages | 9.9 KB PDF    | **8.25 ± 0.06 s** | 10.12 ± 0.01 s | **1.23×** |
+| tiffcp    | 12.7 KB TIFF  | **0.75 ± 0.01 s** | 3.40 ± 0.02 s  | **4.54×** |
+| xmllint   | 8.1 KB XML    | **1.08 ± 0.01 s** | 4.55 ± 0.02 s  | **4.20×** |
+| pdfimages | 9.9 KB PDF    | **4.60 ± 0.07 s** | 10.11 ± 0.00 s | **2.20×** |
 
 The speed delta has two compounding sources: DR's lower per-instruction
 instrumentation overhead vs Pin's `IARG_FAST_ANALYSIS_CALL`, and the

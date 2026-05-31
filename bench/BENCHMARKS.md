@@ -47,7 +47,7 @@ Pin" claim.
 ## Reproducing
 
 ```sh
-# Prereqs: Ubuntu 22.04 or 24.04, DynamoRIO 10.0, Pin 3.20 (optional).
+# Prereqs: Ubuntu 22.04 or 24.04, DynamoRIO 11.3, Pin 3.20 (optional).
 cd libdft-dr
 cmake -B build -DDynamoRIO_DIR=$DR_ROOT/cmake
 cmake --build build -j
@@ -56,7 +56,7 @@ cmake --build build -j
 echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
 
 # Run the bench (5 iters per arm + 1 warmup, ~3 minutes on a 2018 i7):
-DR_ROOT=/path/to/dynamorio-10.0 \
+DR_ROOT=/path/to/dynamorio-11.3.0 \
 PIN_ROOT=/path/to/pin-3.20 \
 LIBDFT_PIN_SO=/path/to/libdft64/tools/libdft-dta.so \
 ./bench/run_perf.sh

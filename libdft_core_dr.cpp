@@ -2234,7 +2234,7 @@ event_bb_insn(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
 /* ---------- Function-entry sinks: module-load resolution + drwrap ---------- */
 
 static void
-func_sink_pre(void *wrapcxt, OUT void **user_data)
+func_sink_pre(void *wrapcxt, DR_PARAM_OUT void **user_data)
 {
     auto *entry = (const libdft_dr_internal::pending_func_sink *)
                   drwrap_get_func(wrapcxt);
