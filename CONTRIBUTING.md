@@ -1,8 +1,7 @@
 # Contributing to libdft-dr
 
-Thanks for considering a contribution. v0.1 is in private development;
-once the repo flips public, this file is the entry point for external
-PRs.
+Thanks for considering a contribution. This file is the entry point
+for external PRs.
 
 ---
 
@@ -40,7 +39,7 @@ The CI workflow that runs on every PR is in
 `.github/workflows/ci.yml`. To replicate it locally:
 
 ```sh
-DR_ROOT=/path/to/DynamoRIO-Linux-11.3.0 ./tests/run_smoke.sh
+DR_ROOT=/path/to/DynamoRIO-Linux-11.3.0-1 ./tests/run_smoke.sh
 ```
 
 This runs two checks:
@@ -61,7 +60,7 @@ Local only — Pin requires an EULA-gated download, so the bench isn't
 in CI.
 
 ```sh
-export DR_ROOT=/path/to/DynamoRIO-Linux-11.3.0
+export DR_ROOT=/path/to/DynamoRIO-Linux-11.3.0-1
 export PIN_ROOT=/path/to/pin-3.20                                # optional
 export LIBDFT_PIN_SO=/path/to/libdft64/tools/libdft-dta.so       # optional
 ./bench/run_perf.sh
@@ -117,11 +116,10 @@ sources (from the v0.1 development history):
 - A handler missed a register-shadow write site → the gap appears in
   cmp.out as missing tag labels.
 - An init-order change disturbed DR's BB-instrumentation pipeline →
-  manifests as a small constant drop in cmp.out line count
-  (~10 lines) that's run-to-run stable. See the
-  `project_libdft_dr_release.md` memory entry on
-  "Parity-gate note" — the 18008-vs-17997 environmental discrepancy
-  is the canonical example.
+  manifests as a small constant drop in cmp.out line count (e.g.
+  ~10 lines on tiffcp seed-2) that's run-to-run stable. Caught
+  during v0.1 dev as an 18008-vs-17997 environmental discrepancy
+  between builds.
 
 ## Code style
 
@@ -141,8 +139,10 @@ sources (from the v0.1 development history):
 - Commit messages explain *why* the change is needed and *what*
   invariant it preserves; bulleted summaries of files-changed are
   fine but not the whole story.
-- **No author names in commit trailers** — skip `Co-Authored-By:` lines.
-  (Project convention; comes from the upstream development workflow.)
+- **No author-attribution trailers** in commit messages (no
+  `Co-Authored-By:`, `Reported-by:`, etc.). Keep commits focused on the
+  change. External contributors are attributed via the GitHub PR author
+  and the commit's git author field.
 - Commit `bench/results.md` only when re-running the bench as part of
   the change; do not commit it for code-only PRs (the numbers go
   stale instantly).
@@ -182,5 +182,5 @@ their tracker is much more responsive for engine bugs.
 ## Roadmap pointers
 
 - v0.1 deferred items and v0.2 plans: [ROADMAP.md](ROADMAP.md).
-- The full release plan (private to vuzzer64-v2 right now):
-  `vuzzer64-v2/docs/libdft-dr-release-plan.md`.
+- Design rationale and engineering lessons: [DESIGN.md](DESIGN.md).
+- Public API design notes: [docs/api-design.md](docs/api-design.md).

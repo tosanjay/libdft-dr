@@ -318,9 +318,6 @@ runs of the same binary.
 
 ## 11. Acknowledgements
 
-The interned-label tag-map representation (§6) was developed jointly
-with Cristiano Giuffrida.
-
 The libdft64 codebase by Vasileios Kemerlis and contributors is the
 reference implementation this work re-implements; the data-flow model,
 syscall hook semantics, and `cmp.out` / `lea.out` wire formats are

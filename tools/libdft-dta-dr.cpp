@@ -53,7 +53,7 @@ DR_EXPORT void
 dr_client_main(client_id_t id, int argc, const char *argv[])
 {
     dr_set_client_name("libdft-dta-dr (Phase 2: source painting)",
-                       "https://github.com/tosanjay/vuzzer64-v2");
+                       "https://github.com/tosanjay/libdft-dr");
     std::string parse_err;
     if (!droption_parser_t::parse_argv(DROPTION_SCOPE_CLIENT, argc, argv,
                                        &parse_err, NULL)) {

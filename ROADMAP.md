@@ -12,7 +12,7 @@ The shipping scope, recapped for context:
 
 - DR-native libdft64 port; per-byte shadow memory, per-instruction
   propagation, syscall source painting, CMP/LEA sinks.
-- Interned-label tag-map representation; **~2.78× faster than Pin
+- Interned-label tag-map representation; **~4.54× faster than Pin
   libdft64** on tiffcp seed-2 ([bench/BENCHMARKS.md](bench/BENCHMARKS.md)).
 - Public `libdft_dr::` API: lifecycle, tag model, sources, sinks
   (opcode-class + PC-range + function-entry).
@@ -43,8 +43,7 @@ init paths (drwrap, drreg's 4-slot config, syscall hooks) rather than
 our propagation code. Closing this gap brings recall from 98.5 % →
 ≥ 99.5 % on tiffcp seed-2.
 
-**Status:** scheduled for v0.2 as the headline correctness milestone
-(see `vuzzer64-v2/docs/libdft-dr-release-plan.md` M1.4 follow-up).
+**Status:** scheduled for v0.2 as the headline correctness milestone.
 
 ### Custom propagation primitives
 
@@ -135,8 +134,11 @@ incremental cached path. The dispatcher will use both.
   variants and diffs the output per-BB, catching the over-approx-mask
   staleness bug class before it ships.
 
-Full scope, acceptance criteria, and risks are in
-`vuzzer64-v2/docs/libdft-dr-release-plan.md` M7.
+Acceptance criteria: ≥ 2× wallclock improvement on tiffcp seed-2 vs
+v0.1; cmp.out / lea.out byte-identical to v0.1 (the parity-gate
+contract is preserved). Risk: the over-approx GPR mask is a
+silent-false-negative bug class (mask incorrectly "clear" → fast path
+runs → taint lost). The paranoid validation mode is the mitigation.
 
 ### M1.4 follow-up: close the REP-string-expansion gap
 

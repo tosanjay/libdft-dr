@@ -86,12 +86,11 @@ override via env vars to point at your own install.
 ## Acceptance criteria (M4)
 
 - libdft-dr faster than Pin libdft64 on tiffcp seed-2 ✅
-  (Headline: 2.78× speedup in this run, vs the README's prior 2.1×
-  single-measurement claim.)
+  (Headline: **4.54× speedup** on this bench host; xmllint 4.20×;
+  pdfimages 2.20×.)
 - Run-to-run variance within 5% on the bench host. ✅
-  (Highest observed: 1.5% stdev/mean on instrumented arms.)
+  (Highest observed: ~1.5% stdev/mean on instrumented arms.)
 - Offset recall regression-guarded at **98.5%** on tiffcp seed-2 ✅
-  (Verified independently; see `project_status_phase5` memory in the
-  vuzzer64-v2 development tree. The 1% gap vs 100% Pin oracle is from
-  the deferred M1.4 REP-string-expansion opcodes; v0.2 closes this.
-  See `docs/api-design.md` and the standalone-repo ROADMAP.)
+  (The 1% gap vs the 100% Pin oracle is from the deferred M1.4
+  REP-string-expansion opcodes; v0.2 closes it. See
+  [../ROADMAP.md](../ROADMAP.md) for the v0.2 plan.)

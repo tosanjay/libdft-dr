@@ -29,16 +29,20 @@ REPO="$(cd "$(dirname "$0")/.." && pwd)"
 # --- knobs (env-overridable) ----------------------------------------------
 BENCH_ITERS="${BENCH_ITERS:-5}"
 BENCH_OUT="${BENCH_OUT:-$REPO/bench/results.md}"
-DR_ROOT="${DR_ROOT:-/home/sanjay/san-home/tools/dynamorio-11.3.0}"
-PIN_ROOT="${PIN_ROOT:-/home/sanjay/san-home/tools/pin-3.20}"
+DR_ROOT="${DR_ROOT:?DR_ROOT must point at the DynamoRIO 11.3 install}"
+PIN_ROOT="${PIN_ROOT:-}"   # optional; if unset/empty, the Pin arm is skipped
 LIBDFT_DR_SO="${LIBDFT_DR_SO:-$REPO/build/clients/vuzzer_cmp_sink/libdft-dta-dr-v2.so}"
-LIBDFT_PIN_SO="${LIBDFT_PIN_SO:-$REPO/../vuzzer64-v2/libdft64/tools/libdft-dta.so}"
+LIBDFT_PIN_SO="${LIBDFT_PIN_SO:-}"   # optional; required only with PIN_ROOT
 
 # --- per-target config -----------------------------------------------------
 # Each target needs: SUT binary, seed file, optional LD_LIBRARY_PATH for
 # bundled SUT libs, and the SUT command template (where %SEED% / %OUT% are
 # substituted at run time). Output path is %OUT%; sized for one invocation.
-VV2="$REPO/../vuzzer64-v2/bin"
+#
+# The default paths point at the sibling vuzzer64-v2 dev-tree layout used
+# during libdft-dr development. External users will override these via
+# the per-target env vars (see "Reproducing" in bench/BENCHMARKS.md).
+VV2="${VV2:-$REPO/../vuzzer64-v2/bin}"
 
 declare -A SUT_BIN SUT_SEED SUT_LDPATH SUT_INVOKE
 SUT_BIN[tiffcp]="$VV2/libtiff/tiffcp"

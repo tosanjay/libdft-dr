@@ -9,7 +9,8 @@ of Intel Pin.
 **~4× faster than Pin libdft64** on parser benchmarks (tiffcp, xmllint);
 byte-equivalent `cmp.out` / `lea.out` output for VUzzer64-style fuzzers.
 
-**Status:** v0.1 in private development; not yet released.
+**Status:** v0.1 — first public release. See [ROADMAP.md](ROADMAP.md) for
+deferred items and v0.2 plans.
 
 ---
 
