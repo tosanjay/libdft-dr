@@ -40,6 +40,9 @@
 #include "tagmap.h"
 #include "mnt_consumer_dr.h"
 
+#include "libdft_dr/sinks.h"
+#include "src/sink_internal.h"
+
 /* ---------- register-shadow foundation ---------- */
 
 /* DR reg_id_t -> DFT VCPU register-file index (row in gpr_file). */
@@ -134,10 +137,11 @@ comma_tokens(const std::string &s)
     return n;
 }
 
-/* print_log: filter fields [3..18], then write all 21 fields space-separated
- * (trailing space after each field, like Pin) + '\n'. */
+/* legacy_write_cmp: filter fields [3..18], then write all 21 fields
+ * space-separated (trailing space after each field, like Pin) + '\n'.
+ * Used only when no client registered a CMP sink (transitional fallback). */
 static void
-emit_cmp(std::vector<std::string> &o)
+legacy_write_cmp(const std::vector<std::string> &o)
 {
     if (out == INVALID_FILE)
         return;
@@ -154,12 +158,13 @@ emit_cmp(std::vector<std::string> &o)
     dr_write_file(out, line.data(), line.size());
 }
 
-/* print_lea_log: 10 fields, filter [2..9], same trailing-space + '\n' layout.
- * Field [0]=width, [1]="baseidx", [2..9]=index-byte tags. (libdft writes the
- * ins address to [2] but immediately clobbers it with the i=0 index tag, so it
- * never appears -- we omit it, matching the on-disk format read_lea expects.) */
+/* legacy_write_lea: 10 fields, filter [2..9], same trailing-space + '\n'
+ * layout. Field [0]=width, [1]="baseidx", [2..9]=index-byte tags. (libdft
+ * writes the ins address to [2] but immediately clobbers it with the i=0
+ * index tag, so it never appears -- we omit it, matching the on-disk format
+ * read_lea expects.) Used only when no client registered a LEA sink. */
 static void
-emit_lea(std::vector<std::string> &o)
+legacy_write_lea(const std::vector<std::string> &o)
 {
     if (out_lea == INVALID_FILE)
         return;
@@ -174,6 +179,48 @@ emit_lea(std::vector<std::string> &o)
     }
     line += '\n';
     dr_write_file(out_lea, line.data(), line.size());
+}
+
+/* emit_cmp / emit_lea: dispatch to registered sinks if any (M3.2 step 4), or
+ * fall through to the legacy `out`/`out_lea` write for backward compat with
+ * the old monolithic tools/libdft-dta-dr.cpp client. CMP operands are passed
+ * as dest_tags then src_tags (concatenated into sink_payload.operand_tags);
+ * LEA passes its index tags as `optags`. */
+static void
+emit_cmp(std::vector<std::string> &o, ptr_uint_t ins,
+         const std::vector<tag_t> &dest_tags,
+         const std::vector<tag_t> &src_tags)
+{
+    if (libdft_dr_internal::has_sink(libdft_dr::opcode_class::CMP)) {
+        libdft_dr_internal::sink_payload pl;
+        pl.legacy_fields = std::move(o);
+        pl.operand_tags.reserve(dest_tags.size() + src_tags.size());
+        for (const auto &t : dest_tags)
+            pl.operand_tags.push_back(libdft_dr::tag_t::from_raw(t.id));
+        for (const auto &t : src_tags)
+            pl.operand_tags.push_back(libdft_dr::tag_t::from_raw(t.id));
+        libdft_dr_internal::dispatch_sink(libdft_dr::opcode_class::CMP,
+            dr_get_current_drcontext(), NULL, (app_pc)(uintptr_t)ins, pl);
+        return;
+    }
+    legacy_write_cmp(o);
+}
+
+static void
+emit_lea(std::vector<std::string> &o, ptr_uint_t ins,
+         const std::vector<tag_t> &optags)
+{
+    if (libdft_dr_internal::has_sink(libdft_dr::opcode_class::LEA)) {
+        libdft_dr_internal::sink_payload pl;
+        pl.legacy_fields = std::move(o);
+        pl.operand_tags.reserve(optags.size());
+        for (const auto &t : optags)
+            pl.operand_tags.push_back(libdft_dr::tag_t::from_raw(t.id));
+        libdft_dr_internal::dispatch_sink(libdft_dr::opcode_class::LEA,
+            dr_get_current_drcontext(), NULL, (app_pc)(uintptr_t)ins, pl);
+        return;
+    }
+    legacy_write_lea(o);
 }
 
 /* read `size` byte-tags from a register span into v (size guaranteed <= 8). */
@@ -528,14 +575,16 @@ lea_prop(ptr_uint_t ins, uint dst_row, uint base_row, uint base_start,
     o[0] = int2str((int)size * 8);
     o[1] = "baseidx";
     int fl = 0;
+    std::vector<tag_t> idx_tags(size);
     for (uint i = 0; i < size; i++) {
         tag_t it = tc->vcpu.gpr_file[idx_row][idx_start + i];
+        idx_tags[i] = it;
         if (tag_count(it))
             fl = 1;
         o[i + 2] = tag_sprint(it);
     }
     if (fl)
-        emit_lea(o);
+        emit_lea(o, ins, idx_tags);
 
     for (uint i = 0; i < size; i++) {
         tag_t b = tc->vcpu.gpr_file[base_row][base_start + i];
@@ -576,7 +625,7 @@ cmp_r2r(ptr_uint_t ins, uint d_row, uint d_start, ptr_uint_t dval,
         }
         o[0] = int2str((int)size * 8);
         o[1] = "reg reg";
-        emit_cmp(o);
+        emit_cmp(o, ins, dest, src);
     }
 }
 
@@ -613,7 +662,7 @@ cmp_m2r(ptr_uint_t ins, uint d_row, uint d_start, ptr_uint_t dval,
         }
         o[0] = int2str((int)size * 8);
         o[1] = "reg mem";
-        emit_cmp(o);
+        emit_cmp(o, ins, dest, src);
     }
 }
 
@@ -644,7 +693,7 @@ cmp_i2r(ptr_uint_t ins, uint d_row, uint d_start, ptr_uint_t dval,
         }
         o[0] = int2str((int)size * 8);
         o[1] = "reg imm";
-        emit_cmp(o);
+        emit_cmp(o, ins, dest, std::vector<tag_t>{});
     }
 }
 
@@ -683,7 +732,7 @@ cmp_r2m(ptr_uint_t ins, ADDRINT dest_addr, uint s_row, uint s_start,
         }
         o[0] = int2str((int)size * 8);
         o[1] = "mem reg";
-        emit_cmp(o);
+        emit_cmp(o, ins, dest, src);
     }
 }
 
@@ -713,7 +762,7 @@ cmp_i2m(ptr_uint_t ins, ADDRINT dest_addr, uint32_t imm, uint size)
         o[20] = hexstr_u(imm);
         o[0] = int2str((int)size * 8);
         o[1] = "mem imm";
-        emit_cmp(o);
+        emit_cmp(o, ins, dest, std::vector<tag_t>{});
     }
 }
 
@@ -761,7 +810,7 @@ cmp_m2m(ptr_uint_t ins, ADDRINT dest_addr, ADDRINT src_addr, uint size)
         }
         o[0] = int2str((int)size * 8);
         o[1] = "mem mem";
-        emit_cmp(o);
+        emit_cmp(o, ins, dest, src);
     }
 }
 

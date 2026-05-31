@@ -113,6 +113,20 @@ tag_count(tag_t const &tag)
     return tag.id != 0;
 }
 
+bool
+tag_walk(tag_t const &tag, bool (*visit)(uint32_t, void *), void *user)
+{
+    if (tag.id == 0 || tag.id >= g_sets.size())
+        return true;
+    /* EWAH iteration: yields set offsets in ascending order. */
+    const ewah_t &s = g_sets[tag.id];
+    for (ewah_t::const_iterator it = s.begin(); it != s.end(); ++it) {
+        if (!visit((uint32_t)*it, user))
+            return false;
+    }
+    return true;
+}
+
 /* ---------- tagmap API ---------- */
 
 int

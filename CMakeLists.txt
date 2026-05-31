@@ -1,5 +1,4 @@
-# libdft-dr -- DynamoRIO port of libdft64 (C.4). DR clients build with CMake
-# (DR is CMake-native), separate from the Pin tree's GNU make.
+# libdft-dr -- DynamoRIO-native dynamic taint analysis library.
 #
 # Build:
 #   cd libdft-dr
@@ -7,9 +6,15 @@
 #   cmake --build build -j
 # where DR_ROOT=/home/sanjay/san-home/tools/dynamorio-10.0
 #
-# Phase 2: source-painting taint foundation -- tagmap (shadow memory), the
-# syscall source hooks, and the per-thread context + drmgr/drreg lifecycle.
-# Opcode propagation (libdft_core) lands in Phases 3-5 of c4_dr_port_plan.md.
+# Layout (M3.2):
+#   src/, include/libdft_dr/   -- the library + public headers
+#   clients/<name>/            -- one DR client per reference pattern
+#                                 (each loads as `drrun -c <name>.so -- app`)
+#
+# v0.1 ships libdft-dr as a STATIC archive that each client links into its
+# own .so; this avoids the DR private-loader's shared-dependency handling
+# during initial bringup. The Q-API.5 SHARED packaging plan is revisited in
+# M5 (public docs / packaging).
 cmake_minimum_required(VERSION 3.10)
 project(libdft_dr C CXX)
 
@@ -22,13 +27,21 @@ if (NOT DynamoRIO_FOUND)
     message(FATAL_ERROR "DynamoRIO not found. Pass -DDynamoRIO_DIR=$DR_ROOT/cmake")
 endif ()
 
-# C++17 (matches the working bbcounts2-dr client's default; EWAHBoolArray's
-# heavy template tags miscompile against this libstdc++ under -std=gnu++14).
+# C++17: EWAHBoolArray's heavy template tags miscompile against this
+# libstdc++ under -std=gnu++14.
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_library(libdft-dta-dr SHARED
-    tools/libdft-dta-dr.cpp
+# ---------------------------------------------------------------------------
+# libdft-dr (STATIC) -- internals + libdft_dr::* public-API wrappers
+# ---------------------------------------------------------------------------
+add_library(libdft-dr STATIC
+    # public-API wrappers
+    src/api_lifecycle.cpp
+    src/api_tag.cpp
+    src/api_sources.cpp
+    src/api_sinks.cpp
+    # internals (top-level files; src/ migration is a v0.2 cosmetic)
     libdft_api_dr.cpp
     syscall_desc_dr.cpp
     tagmap.cpp
@@ -37,12 +50,33 @@ add_library(libdft-dta-dr SHARED
     sdft_summaries_dr.cpp
     sdft_hook_dr.cpp
     libdft_core_dr.cpp)
+target_include_directories(libdft-dr
+    PUBLIC  ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+# Pick up DR include paths + extension headers. configure_DynamoRIO_client on
+# a STATIC target sets only the include/compile flags we need (no link side).
+configure_DynamoRIO_client(libdft-dr)
+foreach (ext drmgr drreg drx drwrap drsyms drutil)
+    use_DynamoRIO_extension(libdft-dr ${ext})
+endforeach ()
+# Position-independent so the final client .so can link us in.
+set_target_properties(libdft-dr PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# ---------------------------------------------------------------------------
+# Reference clients (each its own subdir)
+# ---------------------------------------------------------------------------
+add_subdirectory(clients/vuzzer_cmp_sink)
+
+# ---------------------------------------------------------------------------
+# Legacy single-shot tool (tools/libdft-dta-dr.cpp).
+# Kept building for parity A/B during M3.2 step 3; will be deleted once the
+# vuzzer_cmp_sink client passes the parity gate.
+# ---------------------------------------------------------------------------
+add_library(libdft-dta-dr SHARED tools/libdft-dta-dr.cpp)
 target_include_directories(libdft-dta-dr PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 configure_DynamoRIO_client(libdft-dta-dr)
+target_link_libraries(libdft-dta-dr libdft-dr)
 foreach (ext drmgr drreg drx drwrap drsyms drutil)
     use_DynamoRIO_extension(libdft-dta-dr ${ext})
 endforeach ()
-
-# Drop the lib prefix oddities: DR clients are loaded by path, so a stable
-# name keeps config.py simple.
 set_target_properties(libdft-dta-dr PROPERTIES OUTPUT_NAME "libdft-dta-dr" PREFIX "")

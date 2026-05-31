@@ -67,6 +67,13 @@ std::string tag_sprint(tag_t const & tag);
 /* nonempty test (id != 0) */
 bool tag_count(tag_t const & tag);
 
+/* Walk the labels in `tag` in ascending order. The visitor may return false
+ * to stop early. Used by the public libdft_dr::enumerate(). */
+#include <cstdint>
+bool tag_walk(tag_t const & tag,
+              bool (*visit)(uint32_t label, void *user),
+              void *user);
+
 extern void libdft_die();
 
 /* three-level page table of labels */
