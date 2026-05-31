@@ -28,12 +28,15 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "drmgr.h"
 #include "drreg.h"
+#include "drsyms.h"
 #include "drutil.h"
+#include "drwrap.h"
 
 #include "dr_compat.h"
 #include "libdft_api_dr.h"
@@ -2215,7 +2218,80 @@ event_bb_insn(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
         return DR_EMIT_DEFAULT;  /* C.2 skip */
 
     ins_inspect_dr(drcontext, bb, instr);
+
+    /* M3.2 step 5: PC-range sinks. Inserted AFTER ins_inspect_dr so the
+     * propagation handlers reach drreg first (avoids slot exhaustion seen
+     * pre-ins_inspect). Cheap per-insn check; clean call only fires for
+     * matched ranges. */
+    if (pc != NULL && libdft_dr_internal::has_pc_range_sink_at(pc)) {
+        dr_insert_clean_call(drcontext, bb, instr,
+            (void *)libdft_dr_internal::dispatch_pc_range_sink, false, 1,
+            OPND_CREATE_INTPTR(pc));
+    }
     return DR_EMIT_DEFAULT;
+}
+
+/* ---------- Function-entry sinks: module-load resolution + drwrap ---------- */
+
+static void
+func_sink_pre(void *wrapcxt, OUT void **user_data)
+{
+    auto *entry = (const libdft_dr_internal::pending_func_sink *)
+                  drwrap_get_func(wrapcxt);
+    /* Above is a lookup-by-PC; drwrap returns the original wrap target's
+     * func pc. We stored the entry pointer as user_data at wrap time, but
+     * drwrap_wrap doesn't carry a user_data through to pre_cb; we instead
+     * use drwrap_get_drcontext + walk the registered list. For v0.1 the
+     * pending list is short (handful of entries) so a linear scan is fine. */
+    (void)entry;
+    void *dc = drwrap_get_drcontext(wrapcxt);
+    app_pc pc = (app_pc)drwrap_get_func(wrapcxt);
+    libdft_dr::func_sink_context_t ctx;
+    ctx.drcontext = dc;
+    ctx.entry_pc  = pc;
+    ctx._internal = wrapcxt;
+    for (const auto &e : libdft_dr_internal::func_sinks()) {
+        if (e.pc != 0 && e.pc == pc) e.cb(ctx);
+        /* For name-resolved entries we set e.pc once we wrap them (see
+         * module-load handler) -- after that they hit the pc-match branch. */
+    }
+    (void)user_data;
+}
+
+static void
+func_sink_on_module_load(void *drcontext, const module_data_t *info, bool loaded)
+{
+    (void)drcontext; (void)loaded;
+    if (info == NULL) return;
+    /* For each pending name-based entry whose module filter matches this
+     * loaded module, look up the symbol via drsym and drwrap_wrap it.
+     * v0.1: drsym lookup is synchronous; for very large stripped binaries
+     * this could be slow on first load but typical clients wrap O(10) names. */
+    const char *path = info->full_path;
+    if (path == NULL) path = "";
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+
+    auto &pending = const_cast<std::vector<libdft_dr_internal::pending_func_sink>&>(
+        libdft_dr_internal::func_sinks());
+    for (auto &e : pending) {
+        if (!e.func_name.empty() && e.pc == 0) {
+            if (!e.module_basename.empty() && e.module_basename != base)
+                continue;
+            size_t modoffs = 0;
+            drsym_error_t r = drsym_lookup_symbol(path, e.func_name.c_str(),
+                                                  &modoffs, DRSYM_DEMANGLE);
+            if (r == DRSYM_SUCCESS && modoffs != 0) {
+                app_pc wrap_pc = info->start + modoffs;
+                if (drwrap_wrap(wrap_pc, func_sink_pre, NULL)) {
+                    e.pc = wrap_pc;  /* mark resolved so pre_cb fires the right entry */
+                    dr_fprintf(STDERR,
+                        "[libdft_dr] func_sink: wrapped %s!%s @ %p\n",
+                        base, e.func_name.c_str(), wrap_pc);
+                }
+            }
+        }
+    }
 }
 
 void
@@ -2237,4 +2313,27 @@ libdft_core_init(void)
      * forms, so the handlers earn their keep even without expansion. */
     drmgr_register_bb_instrumentation_event(NULL /*analysis*/, event_bb_insn,
                                             NULL);
+
+    /* M3.2 step 5: function-entry sink resolution. Pre-registered PC entries
+     * (register_func_sink_pc) are wrapped immediately; name-based entries
+     * (register_func_sink) are resolved at module-load time.
+     *
+     * drwrap/drsym are also init'd by sdft_hook::init(), but that fails
+     * silently when the sdft conf is missing (typical for non-vuzzer
+     * clients). Init them explicitly here -- both are reference-counted in
+     * DR 10 so a second init is a no-op. Skip the whole module-load
+     * registration when no func_sinks are pending (avoids touching the BB
+     * pipeline on existing parity gates). */
+    if (!libdft_dr_internal::func_sinks().empty()) {
+        drsym_init(0);
+        drwrap_init();
+        drmgr_register_module_load_event(func_sink_on_module_load);
+        for (auto &e : const_cast<std::vector<libdft_dr_internal::pending_func_sink>&>(
+                           libdft_dr_internal::func_sinks())) {
+            if (e.pc != 0 && e.func_name.empty()) {
+                if (drwrap_wrap(e.pc, func_sink_pre, NULL))
+                    dr_fprintf(STDERR, "[libdft_dr] func_sink: wrapped PC %p\n", e.pc);
+            }
+        }
+    }
 }

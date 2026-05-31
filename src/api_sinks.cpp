@@ -19,16 +19,23 @@
 #include <vector>
 
 #include "dr_api.h"
+#include "drwrap.h"
 
 #include "libdft_dr/sinks.h"
 #include "libdft_dr/tag.h"
 
 #include "sink_internal.h"
+#include "tagmap.h"
 
 namespace libdft_dr_internal {
 
 namespace {
 std::map<libdft_dr::opcode_class, std::vector<libdft_dr::sink_cb>> g_opcode_sinks;
+
+struct pc_range_entry { app_pc lo; app_pc hi; libdft_dr::sink_cb cb; };
+std::vector<pc_range_entry> g_pc_ranges;
+
+std::vector<pending_func_sink> g_pending_func_sinks;
 }  // namespace
 
 bool has_sink(libdft_dr::opcode_class cls) {
@@ -47,6 +54,30 @@ void dispatch_sink(libdft_dr::opcode_class cls,
     ctx.pc        = pc;
     ctx._internal = &pl;
     for (auto &cb : it->second) cb(ctx);
+}
+
+bool has_pc_range_sink_at(app_pc pc) {
+    for (auto &e : g_pc_ranges)
+        if (pc >= e.lo && pc < e.hi) return true;
+    return false;
+}
+
+void dispatch_pc_range_sink(app_pc pc) {
+    sink_payload pl;  /* operand_tags empty -- PC-range sinks have no operand
+                       * info; clients use libdft_dr::get_mem_tag_range etc.
+                       * to inspect whatever they care about. */
+    libdft_dr::sink_context_t ctx;
+    ctx.drcontext = dr_get_current_drcontext();
+    ctx.instr     = NULL;
+    ctx.pc        = pc;
+    ctx._internal = &pl;
+    for (auto &e : g_pc_ranges)
+        if (pc >= e.lo && pc < e.hi)
+            e.cb(ctx);
+}
+
+const std::vector<pending_func_sink> &func_sinks() {
+    return g_pending_func_sinks;
 }
 
 }  // namespace libdft_dr_internal
@@ -93,27 +124,88 @@ const std::vector<std::string> &sink_context_t::legacy_record() const {
     return pl_of(this)->legacy_fields;
 }
 
-/* ---- PC-range sinks (stub: step 5) ---- */
+/* ---- PC-range sinks ---- */
 
-void register_pc_range_sink(app_pc, app_pc, sink_cb) {
-    dr_fprintf(STDERR, "[libdft_dr] register_pc_range_sink: stub (v0.1 M3.2 step 5)\n");
+void register_pc_range_sink(app_pc lo, app_pc hi, sink_cb cb) {
+    if (lo >= hi) {
+        dr_fprintf(STDERR, "[libdft_dr] register_pc_range_sink: empty range "
+                           "[%p,%p) -- ignoring\n", lo, hi);
+        return;
+    }
+    libdft_dr_internal::g_pc_ranges.push_back({lo, hi, std::move(cb)});
 }
 
-/* ---- Function-entry sinks (stub: step 5) ---- */
+/* ---- Function-entry sinks ----
+ *
+ * Registration just enqueues; the actual drsym + drwrap work happens in
+ * libdft_core_dr.cpp's module-load handler (after libdft_setup wires the
+ * module event). For PC-direct registration the wrap can be applied
+ * immediately. */
 
-std::uintptr_t func_sink_context_t::arg(unsigned) const { return 0; }
-tag_t func_sink_context_t::arg_tag(unsigned) const { return tag_t{}; }
-tag_t func_sink_context_t::arg_pointed_tag(unsigned, std::size_t) const { return tag_t{}; }
-bool func_sink_context_t::arg_pointed_is_tainted(unsigned, std::size_t) const { return false; }
-void func_sink_context_t::for_each_arg_tag(unsigned, const arg_visitor &) const {}
+namespace {
+inline void *wrapcxt_of(const func_sink_context_t *c) {
+    return c->_internal;
+}
+}  // namespace
 
-bool register_func_sink(const std::string &, const std::string &, func_sink_cb) {
-    dr_fprintf(STDERR, "[libdft_dr] register_func_sink: stub (v0.1 M3.2 step 5)\n");
+std::uintptr_t func_sink_context_t::arg(unsigned idx) const {
+    return (std::uintptr_t)drwrap_get_arg(wrapcxt_of(this), (int)idx);
+}
+
+tag_t func_sink_context_t::arg_tag(unsigned idx) const {
+    /* The argument value occupies a register or stack slot. We don't know
+     * which without walking the mcontext; v0.1 returns the tag of the first
+     * byte of the arg-as-uintptr (matches libdft's "scalar arg tag" notion
+     * for the common case of a register-passed arg). For pointer args, use
+     * arg_pointed_tag instead. */
+    (void)idx;
+    return tag_t{};  /* v0.1 placeholder: full impl requires mcontext walk */
+}
+
+tag_t func_sink_context_t::arg_pointed_tag(unsigned idx, std::size_t n) const {
+    if (n == 0) return tag_t{};
+    std::uintptr_t p = arg(idx);
+    if (p == 0) return tag_t{};
+    ::tag_t acc; acc.id = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        ::tag_t b = ::file_tagmap_getb((ADDRINT)(p + i));
+        acc = ::tag_combine(acc, b);
+    }
+    return tag_t::from_raw(acc.id);
+}
+
+bool func_sink_context_t::arg_pointed_is_tainted(unsigned idx, std::size_t n) const {
+    if (n == 0) return false;
+    std::uintptr_t p = arg(idx);
+    if (p == 0) return false;
+    for (std::size_t i = 0; i < n; ++i) {
+        ::tag_t b = ::file_tagmap_getb((ADDRINT)(p + i));
+        if (b.id != 0) return true;
+    }
     return false;
 }
 
-void register_func_sink_pc(app_pc, func_sink_cb) {
-    dr_fprintf(STDERR, "[libdft_dr] register_func_sink_pc: stub (v0.1 M3.2 step 5)\n");
+void func_sink_context_t::for_each_arg_tag(unsigned n_args,
+                                           const arg_visitor &fn) const {
+    for (unsigned i = 0; i < n_args; ++i)
+        if (!fn(i, arg_tag(i))) return;
+}
+
+bool register_func_sink(const std::string &func_name,
+                        const std::string &module_basename,
+                        func_sink_cb cb) {
+    if (func_name.empty()) {
+        dr_fprintf(STDERR, "[libdft_dr] register_func_sink: empty name\n");
+        return false;
+    }
+    libdft_dr_internal::g_pending_func_sinks.push_back(
+        {func_name, module_basename, nullptr, std::move(cb)});
+    return true;
+}
+
+void register_func_sink_pc(app_pc entry_pc, func_sink_cb cb) {
+    libdft_dr_internal::g_pending_func_sinks.push_back(
+        {"", "", entry_pc, std::move(cb)});
 }
 
 }  // namespace libdft_dr

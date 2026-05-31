@@ -66,6 +66,9 @@ set_target_properties(libdft-dr PROPERTIES POSITION_INDEPENDENT_CODE ON)
 # Reference clients (each its own subdir)
 # ---------------------------------------------------------------------------
 add_subdirectory(clients/vuzzer_cmp_sink)
+add_subdirectory(clients/file_introspect)
+add_subdirectory(clients/egress_sanitizer)
+add_subdirectory(clients/synthetic_unit)
 
 # ---------------------------------------------------------------------------
 # Legacy single-shot tool (tools/libdft-dta-dr.cpp).

@@ -99,6 +99,9 @@ struct func_sink_context_t {
      * Visitor may return false to stop early. */
     using arg_visitor = std::function<bool(unsigned arg_idx, tag_t t)>;
     void for_each_arg_tag(unsigned n_args, const arg_visitor &fn) const;
+
+    /* Opaque drwrap wrapcxt pointer; clients must not touch. */
+    void *_internal;
 };
 
 using func_sink_cb = std::function<void(const func_sink_context_t &)>;

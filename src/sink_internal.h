@@ -33,6 +33,29 @@ void dispatch_sink(libdft_dr::opcode_class cls,
                    void *drcontext, instr_t *instr, app_pc pc,
                    sink_payload &pl);
 
+/* ---- PC-range sinks ---- */
+
+/* Cheap instrument-time check: does any registered range contain `pc`?
+ * libdft_core_dr.cpp's BB instrumentation event consults this per-instruction
+ * to decide whether to insert a clean call. */
+bool has_pc_range_sink_at(app_pc pc);
+
+/* Runtime clean-call target: invoked from inserted instrumentation; iterates
+ * registered ranges and fires every one whose [lo, hi) contains `pc`. */
+void dispatch_pc_range_sink(app_pc pc);
+
+/* ---- Function-entry sinks ---- */
+
+/* Pending-registration view for libdft_core_dr.cpp to consume in its module-
+ * load event (drsym + drwrap resolution happens there). */
+struct pending_func_sink {
+    std::string func_name;     /* if non-empty: resolve via drsym */
+    std::string module_basename; /* "" = any module */
+    app_pc      pc;            /* if non-zero: use directly, skip drsym */
+    libdft_dr::func_sink_cb cb;
+};
+const std::vector<pending_func_sink> &func_sinks();
+
 }  // namespace libdft_dr_internal
 
 #endif  /* LIBDFT_DR_SINK_INTERNAL_H_ */
