@@ -147,6 +147,11 @@ map data structure (see [DESIGN.md](DESIGN.md) and `tagmap.cpp`).
   reproduction instructions.
 - [CONTRIBUTING.md](CONTRIBUTING.md) — build, test, parity-gate workflow,
   PR conventions.
+  
+## Acknowledgement
+
+CC + Opus 4.7 has been my co-pilot in the development of this project. 
+My take: If one knows what they want to build and have good understanding of the nitty-gritty of the stuff, this human-AI colab works well! 
 
 ## License
 
